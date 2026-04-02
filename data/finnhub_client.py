@@ -149,6 +149,42 @@ class FinnhubClient:
             "strong_sell": latest.get("strongSell", 0),
         }
 
+    async def get_earnings_calendar(self, symbol: str) -> list[dict]:
+        """Get upcoming and recent earnings dates for a symbol.
+
+        Uses /calendar/earnings filtered by symbol. Returns list of
+        [{date, epsActual, epsEstimate, revenueActual, revenueEstimate, symbol}, ...]
+        sorted by date ascending.
+        """
+        from datetime import date as _date, timedelta as _td
+
+        start = (_date.today() - _td(days=30)).isoformat()
+        end = (_date.today() + _td(days=90)).isoformat()
+
+        data = await self._request(
+            "/calendar/earnings",
+            {"symbol": symbol, "from": start, "to": end},
+        )
+
+        if not data or "earningsCalendar" not in data:
+            return []
+
+        results = []
+        for e in data["earningsCalendar"]:
+            if e.get("symbol") != symbol:
+                continue
+            results.append({
+                "date": e.get("date"),
+                "eps_actual": e.get("epsActual"),
+                "eps_estimate": e.get("epsEstimate"),
+                "revenue_actual": e.get("revenueActual"),
+                "revenue_estimate": e.get("revenueEstimate"),
+                "hour": e.get("hour"),  # "bmo" (before), "amc" (after), "dmh" (during)
+            })
+
+        results.sort(key=lambda x: x.get("date") or "")
+        return results
+
     async def _request(self, path: str, params: dict) -> dict | list | None:
         """Make a rate-limited request to Finnhub API."""
         now = time.monotonic()
@@ -165,15 +201,21 @@ class FinnhubClient:
                 resp = await client.get(url, params=params)
 
                 if resp.status_code == 429:
-                    _log.warning("event=finnhub_rate_limited path=%s", path)
+                    _log.warning("Finnhub 429 rate-limited on %s — retrying in 2s", path)
                     await asyncio.sleep(2)
                     resp = await client.get(url, params=params)
 
-                if resp.status_code != 200:
-                    _log.warning("event=finnhub_error path=%s status=%d", path, resp.status_code)
+                if resp.status_code == 403:
+                    _log.warning("Finnhub 403 forbidden on %s (endpoint not in plan)", path)
                     return None
 
-                return resp.json()
+                if resp.status_code != 200:
+                    _log.warning("Finnhub HTTP %d on %s", resp.status_code, path)
+                    return None
+
+                data = resp.json()
+                _log.debug("Finnhub %s → %d bytes", path, len(resp.content))
+                return data
         except Exception as exc:
-            _log.error("event=finnhub_request_failed path=%s error=%s", path, exc)
+            _log.error("Finnhub request failed %s — %s", path, exc)
             return None

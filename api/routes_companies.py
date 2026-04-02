@@ -1,10 +1,23 @@
 """Company evaluation API — ranked list and individual company detail."""
 
+from datetime import datetime, timezone
 from fastapi import APIRouter, Query
 from db.database import get_session, CompanyEvaluation
 from sqlalchemy import select, desc, func
+from config import get_settings
 
 router = APIRouter()
+
+
+def _staleness_info(evaluated_at, refresh_days: int) -> dict:
+    """Compute staleness fields for an evaluation timestamp."""
+    if not evaluated_at:
+        return {"days_since_evaluation": None, "is_stale": True}
+    now = datetime.now(timezone.utc)
+    if evaluated_at.tzinfo is None:
+        evaluated_at = evaluated_at.replace(tzinfo=timezone.utc)
+    days = (now - evaluated_at).total_seconds() / 86400
+    return {"days_since_evaluation": round(days, 1), "is_stale": days > refresh_days}
 
 @router.get("/companies/ranked")
 async def get_ranked_companies(
@@ -13,6 +26,9 @@ async def get_ranked_companies(
     min_score: float = Query(None),
 ):
     """Get companies ranked by composite score (highest first)."""
+    settings = get_settings()
+    refresh_days = settings.refresh_period_days
+
     async with get_session() as session:
         query = select(CompanyEvaluation).order_by(desc(CompanyEvaluation.composite_score))
         
@@ -27,6 +43,7 @@ async def get_ranked_companies(
         
         return {
             "count": len(companies),
+            "refresh_period_days": refresh_days,
             "companies": [
                 {
                     "rank": c.rank,
@@ -47,6 +64,7 @@ async def get_ranked_companies(
                     "llm_conviction": c.llm_conviction,
                     "llm_summary": c.llm_summary,
                     "evaluated_at": c.evaluated_at.isoformat() if c.evaluated_at else None,
+                    **_staleness_info(c.evaluated_at, refresh_days),
                 }
                 for c in companies
             ],
@@ -68,6 +86,8 @@ async def get_sectors():
 @router.get("/companies/{symbol}")
 async def get_company_detail(symbol: str):
     """Get full evaluation detail for a single company."""
+    settings = get_settings()
+
     async with get_session() as session:
         result = await session.execute(
             select(CompanyEvaluation).where(CompanyEvaluation.symbol == symbol.upper())
@@ -109,4 +129,5 @@ async def get_company_detail(symbol: str):
             },
             "evaluated_at": company.evaluated_at.isoformat() if company.evaluated_at else None,
             "data_freshness": company.data_freshness,
+            **_staleness_info(company.evaluated_at, settings.refresh_period_days),
         }

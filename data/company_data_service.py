@@ -36,7 +36,9 @@ class CompanyDataService:
 
     async def get_company_data(self, symbol: str) -> dict:
         """Fetch ALL data needed for company evaluation."""
-        _log.info("event=company_data_start symbol=%s", symbol)
+        import time
+        t0 = time.time()
+        _log.info("[%s] DATA: Begin fetching from all sources...", symbol)
         yahoo_used = False
 
         # === POLYGON: Financial statements + price history ===
@@ -46,18 +48,22 @@ class CompanyDataService:
         company_details = None
 
         if self._polygon:
+            _log.info("[%s] DATA: Fetching Polygon quarterly financials...", symbol)
             financials_quarterly = await self._safe(
                 "polygon_financials_q",
                 self._polygon.get_financials, symbol, limit=12, timeframe="quarterly",
             )
+            _log.info("[%s] DATA: Fetching Polygon annual financials...", symbol)
             financials_annual = await self._safe(
                 "polygon_financials_a",
-                self._polygon.get_financials, symbol, limit=5, timeframe="annual",
+                self._polygon.get_financials, symbol, limit=8, timeframe="annual",
             )
+            _log.info("[%s] DATA: Fetching Polygon price history...", symbol)
             price_history = await self._safe(
                 "polygon_prices",
                 self._polygon.get_price_history, symbol, days=365,
             )
+            _log.info("[%s] DATA: Fetching Polygon company details...", symbol)
             company_details = await self._safe(
                 "polygon_details",
                 self._polygon.get_company_details, symbol,
@@ -73,24 +79,31 @@ class CompanyDataService:
         recommendations = None
 
         if self._finnhub:
+            _log.info("[%s] DATA: Fetching Finnhub basic financials (117 ratios)...", symbol)
             basic_financials = await self._safe(
                 "finnhub_metrics", self._finnhub.get_basic_financials, symbol,
             )
+            _log.info("[%s] DATA: Fetching Finnhub company profile...", symbol)
             profile = await self._safe(
                 "finnhub_profile", self._finnhub.get_company_profile, symbol,
             )
+            _log.info("[%s] DATA: Fetching Finnhub EPS estimates...", symbol)
             eps_estimates = await self._safe(
                 "finnhub_estimates", self._finnhub.get_eps_estimates, symbol,
             )
+            _log.info("[%s] DATA: Fetching Finnhub price target...", symbol)
             price_target = await self._safe(
                 "finnhub_target", self._finnhub.get_price_target, symbol,
             )
+            _log.info("[%s] DATA: Fetching Finnhub insider transactions...", symbol)
             insiders = await self._safe(
                 "finnhub_insiders", self._finnhub.get_insider_transactions, symbol,
             )
+            _log.info("[%s] DATA: Fetching Finnhub peers...", symbol)
             peers = await self._safe(
                 "finnhub_peers", self._finnhub.get_peers, symbol,
             )
+            _log.info("[%s] DATA: Fetching Finnhub recommendations...", symbol)
             recommendations = await self._safe(
                 "finnhub_recs", self._finnhub.get_recommendation_trends, symbol,
             )
@@ -132,13 +145,17 @@ class CompanyDataService:
         }
 
         _log.info(
-            "event=company_data_complete symbol=%s quality=%s yahoo_fallback=%s",
-            symbol, result["data_quality"], yahoo_used,
+            "[%s] DATA: Complete in %.1fs — quality=%s yahoo_fallback=%s",
+            symbol, time.time() - t0, result["data_quality"], yahoo_used,
         )
         return result
 
     def _merge_profile(self, polygon_details, finnhub_profile) -> dict:
-        """Merge company profile from multiple sources, preferring non-None values."""
+        """Merge company profile from multiple sources.
+
+        Polygon is PRIMARY (paid tier has reliable market_cap, description,
+        employees). Finnhub supplements with sector/industry names.
+        """
         merged = {
             "company_name": None,
             "sector": None,
@@ -150,30 +167,31 @@ class CompanyDataService:
             "country": None,
         }
 
-        # Finnhub profile (preferred for sector, name)
-        if finnhub_profile and not finnhub_profile.get("error"):
-            merged["company_name"] = finnhub_profile.get("company_name")
-            merged["sector"] = finnhub_profile.get("sector")
-            merged["market_cap"] = finnhub_profile.get("market_cap")
-            if merged["market_cap"]:
-                merged["market_cap"] *= 1_000_000  # Finnhub returns in millions
-            merged["website"] = finnhub_profile.get("website")
-            merged["country"] = finnhub_profile.get("country")
-
-        # Polygon fills gaps
+        # Polygon details (primary for name, market_cap, description, employees)
         if polygon_details and not polygon_details.get("error"):
+            merged["company_name"] = polygon_details.get("company_name")
+            merged["sector"] = polygon_details.get("sector")
+            merged["market_cap"] = polygon_details.get("market_cap")
+            merged["description"] = polygon_details.get("description")
+            merged["employees"] = polygon_details.get("employees")
+            merged["website"] = polygon_details.get("homepage")
+
+        # Finnhub fills gaps (better sector names, country)
+        if finnhub_profile and not finnhub_profile.get("error"):
             if not merged["company_name"]:
-                merged["company_name"] = polygon_details.get("company_name")
-            if not merged["sector"]:
-                merged["sector"] = polygon_details.get("sector")
+                merged["company_name"] = finnhub_profile.get("company_name")
+            if not merged["sector"] or merged["sector"] == polygon_details.get("sector"):
+                # Finnhub sector names are often more descriptive
+                fh_sector = finnhub_profile.get("sector")
+                if fh_sector:
+                    merged["sector"] = fh_sector
             if not merged["market_cap"]:
-                merged["market_cap"] = polygon_details.get("market_cap")
-            if not merged["description"]:
-                merged["description"] = polygon_details.get("description")
-            if not merged["employees"]:
-                merged["employees"] = polygon_details.get("employees")
+                mc = finnhub_profile.get("market_cap")
+                if mc:
+                    merged["market_cap"] = mc * 1_000_000  # Finnhub returns millions
             if not merged["website"]:
-                merged["website"] = polygon_details.get("homepage")
+                merged["website"] = finnhub_profile.get("website")
+            merged["country"] = finnhub_profile.get("country")
 
         return merged
 
@@ -197,10 +215,18 @@ class CompanyDataService:
 
     async def _safe(self, name: str, func, *args, **kwargs):
         """Call a data fetch function with error handling."""
+        import time
+        t = time.time()
         try:
-            return await func(*args, **kwargs)
+            result = await func(*args, **kwargs)
+            elapsed = time.time() - t
+            if isinstance(result, dict) and result.get("error"):
+                _log.warning("  └─ %s: FAILED in %.1fs — %s", name, elapsed, result["error"])
+            else:
+                _log.info("  └─ %s: OK in %.1fs", name, elapsed)
+            return result
         except Exception as exc:
-            _log.warning("event=data_fetch_failed source=%s error=%s", name, exc)
+            _log.warning("  └─ %s: EXCEPTION in %.1fs — %s", name, time.time() - t, exc)
             return {"error": str(exc)}
 
     async def _fetch_yahoo_fallback(self, symbol: str) -> dict | None:

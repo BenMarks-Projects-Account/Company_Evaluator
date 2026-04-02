@@ -15,6 +15,8 @@ Metrics and inner-pillar weights:
 
 from __future__ import annotations
 
+import logging
+
 from metrics.helpers import (
     safe_div,
     score,
@@ -24,6 +26,8 @@ from metrics.helpers import (
     ttm_sum,
     coeff_of_variation,
 )
+
+_log = logging.getLogger(__name__)
 
 # Scoring bounds  (value_at_0, value_at_100)
 _BOUNDS = {
@@ -49,6 +53,8 @@ def compute(data: dict) -> dict:
     """Return ``{pillar_score, metrics, scores}`` for Business Quality."""
     quarterly = get_statements(data, "quarterly")
     fh = get_finnhub_metrics(data)
+    _log.info("    [BQ] Computing with %d quarterly statements, %d finnhub metrics",
+              len(quarterly), len(fh))
 
     # --- ROIC (TTM) ---
     # NOPAT = operating_income * (1 − effective_tax_rate)
@@ -75,6 +81,10 @@ def compute(data: dict) -> dict:
     if roic is None:
         fh_roic = fh.get("roicTTM")
         roic = fh_roic / 100 if fh_roic is not None else None
+        if roic is not None:
+            _log.info("    [BQ] ROIC: using Finnhub fallback = %.4f", roic)
+    else:
+        _log.info("    [BQ] ROIC: computed from statements = %.4f", roic)
 
     # --- Margins (TTM) ---
     rev_ttm = ttm_sum(quarterly, "revenue")
@@ -124,6 +134,11 @@ def compute(data: dict) -> dict:
     scores = {k: score(metrics[k], *_BOUNDS[k]) for k in _BOUNDS}
 
     pillar = weighted_avg([(scores[k], _WEIGHTS[k]) for k in _WEIGHTS])
+
+    _log.info("    [BQ] Final: roic=%s gm=%s om=%s nm=%s fcf_y=%s rev_s=%s -> pillar=%.1f",
+              metrics["roic"], metrics["gross_margin"], metrics["op_margin"],
+              metrics["net_margin"], metrics["fcf_yield"], metrics["rev_stability"],
+              pillar or 0)
 
     return {"pillar_score": pillar, "metrics": metrics, "scores": scores}
 

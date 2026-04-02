@@ -13,6 +13,8 @@ Metrics and inner-pillar weights:
 
 from __future__ import annotations
 
+import logging
+
 from metrics.helpers import (
     safe_div,
     score,
@@ -22,6 +24,8 @@ from metrics.helpers import (
     ttm_sum,
     latest,
 )
+
+_log = logging.getLogger(__name__)
 
 _BOUNDS = {
     "ev_ebitda":         (5.0, 30.0),     # 5× (cheap) → 30× (expensive)
@@ -92,6 +96,11 @@ def compute(data: dict) -> dict:
     }
 
     pillar = weighted_avg([(scores[k], _WEIGHTS[k]) for k in _WEIGHTS])
+
+    _log.info("    [VE] Final: ev/ebitda=%s pe=%s pfcf=%s accruals=%s analyst=%s -> pillar=%.1f",
+              metrics["ev_ebitda"], metrics["pe_ratio"], metrics["pfcf"],
+              metrics["accruals_ratio"],
+              scores.get("analyst_consensus"), pillar or 0)
 
     return {"pillar_score": pillar, "metrics": metrics, "scores": scores}
 

@@ -11,6 +11,7 @@ Pillar weights (from framework spec):
 from __future__ import annotations
 
 import logging
+import time
 
 from metrics import (
     business_quality,
@@ -55,10 +56,13 @@ def compute_composite_score(data: dict) -> dict:
     pillars: dict[str, dict] = {}
 
     for name, func in _PILLAR_FUNCS.items():
+        t = time.time()
         try:
             pillars[name] = func(data)
+            ps = pillars[name].get("pillar_score")
+            _log.info("  Pillar %-25s = %s/100  (%.2fs)", name, ps, time.time() - t)
         except Exception as exc:
-            _log.error("event=pillar_error pillar=%s error=%s", name, exc)
+            _log.error("  Pillar %-25s FAILED: %s  (%.2fs)", name, exc, time.time() - t, exc_info=True)
             pillars[name] = {"pillar_score": None, "metrics": {}, "scores": {}}
 
     composite = weighted_avg([

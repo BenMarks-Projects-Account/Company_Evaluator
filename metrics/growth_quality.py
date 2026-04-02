@@ -12,6 +12,8 @@ Metrics and inner-pillar weights:
 
 from __future__ import annotations
 
+import logging
+
 from metrics.helpers import (
     safe_div,
     score,
@@ -20,6 +22,8 @@ from metrics.helpers import (
     get_finnhub_metrics,
     cagr,
 )
+
+_log = logging.getLogger(__name__)
 
 _BOUNDS = {
     "revenue_cagr_3y": (-0.02, 0.20),  # −2 % → +20 %
@@ -94,6 +98,11 @@ def compute(data: dict) -> dict:
     }
 
     pillar = weighted_avg([(scores_dict[k], _WEIGHTS[k]) for k in _WEIGHTS])
+
+    _log.info("    [GQ] Final: rev3y=%s rev5y=%s fcf=%s eps=%s margin=%s -> pillar=%.1f",
+              metrics["revenue_cagr_3y"], metrics["revenue_cagr_5y"],
+              metrics["fcf_growth"], metrics["eps_growth_yoy"],
+              metrics["margin_trend"], pillar or 0)
 
     return {"pillar_score": pillar, "metrics": metrics, "scores": scores_dict}
 

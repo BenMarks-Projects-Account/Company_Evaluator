@@ -13,6 +13,8 @@ Metrics and inner-pillar weights:
 
 from __future__ import annotations
 
+import logging
+
 from metrics.helpers import (
     safe_div,
     score,
@@ -22,6 +24,8 @@ from metrics.helpers import (
     ttm_sum,
     latest,
 )
+
+_log = logging.getLogger(__name__)
 
 _BOUNDS = {
     "sga_efficiency":    (0.05, 0.40),    # 5 % (best) → 40 % (worst)
@@ -128,6 +132,11 @@ def compute(data: dict) -> dict:
         scores[k] = score(metrics[k], *_BOUNDS[k], invert=(k in _INVERTED))
 
     pillar = weighted_avg([(scores[k], _WEIGHTS[k]) for k in _WEIGHTS])
+
+    _log.info("    [OH] Final: sga=%s d/ebitda=%s int_cov=%s cur_r=%s cash_c=%s alt_z=%s -> pillar=%.1f",
+              metrics["sga_efficiency"], metrics["debt_to_ebitda"], metrics["interest_coverage"],
+              metrics["current_ratio"], metrics["cash_conversion"], metrics["altman_z"],
+              pillar or 0)
 
     return {"pillar_score": pillar, "metrics": metrics, "scores": scores}
 

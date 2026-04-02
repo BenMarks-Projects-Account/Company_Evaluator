@@ -1,0 +1,39 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.egg-info/
+*.egg
+dist/
+build/
+
+# Virtual environment
+.venv/
+venv/
+
+# Environment variables (contains API keys)
+.env
+
+# Database
+db/*.db
+db/*.db-journal
+db/*.db-wal
+db/*.db-shm
+
+# Logs
+logs/*.log
+
+# Data cache
+data/cache/
+
+# IDE
+.vscode/
+.idea/
+
+# OS
+Thumbs.db
+.DS_Store
+
+# PyInstaller
+*.spec
+*.manifest

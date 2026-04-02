@@ -13,10 +13,11 @@ _log = logging.getLogger(__name__)
 class PolygonClient:
     """Fetches financial statements and price data from Polygon.io."""
 
-    def __init__(self, api_key: str, rate_limit: float = 5.0):
+    def __init__(self, api_key: str, rate_limit: float = 100.0):
         self._api_key = api_key
         self._base_url = "https://api.polygon.io"
-        self._min_interval = 1.0 / rate_limit
+        # Polygon Starter: unlimited calls. Keep 100ms courtesy delay.
+        self._min_interval = 1.0 / rate_limit  # 0.01s at 100 req/s
         self._last_request = 0.0
 
     async def get_financials(self, symbol: str, limit: int = 12, timeframe: str = "quarterly") -> dict:
@@ -168,6 +169,231 @@ class PolygonClient:
             "sharpe_approx": float(np.mean(daily_returns) / np.std(daily_returns) * np.sqrt(252)) if np.std(daily_returns) > 0 else None,
         }
 
+    async def get_raw_bars(self, symbol: str, days: int = 365) -> list[dict] | None:
+        """Get raw daily OHLCV bars for technical analysis.
+
+        Returns a list of dicts: [{date, open, high, low, close, volume}, ...]
+        sorted oldest-first, or None on failure.
+        """
+        end = date.today()
+        start = end - timedelta(days=days)
+
+        data = await self._request(
+            f"/v2/aggs/ticker/{symbol}/range/1/day/{start.isoformat()}/{end.isoformat()}",
+            {"adjusted": "true", "limit": 5000},
+        )
+
+        if not data or "results" not in data:
+            return None
+
+        bars = data["results"]
+        if not bars:
+            return None
+
+        result = []
+        for b in bars:
+            if "c" not in b or "t" not in b:
+                continue
+            result.append({
+                "date": date.fromtimestamp(b["t"] / 1000).isoformat(),
+                "open": b.get("o"),
+                "high": b.get("h"),
+                "low": b.get("l"),
+                "close": b["c"],
+                "volume": b.get("v", 0),
+            })
+        return result
+
+    async def get_rsi(self, symbol: str, window: int = 14,
+                      timespan: str = "day", limit: int = 1) -> float | None:
+        """Get RSI from Polygon's technical indicators endpoint.
+
+        Returns the most recent RSI value, or None on failure.
+        """
+        data = await self._request(
+            f"/v1/indicators/rsi/{symbol}",
+            {"timespan": timespan, "window": window, "limit": limit,
+             "series_type": "close", "order": "desc"},
+        )
+        if not data:
+            return None
+        try:
+            values = data.get("results", {}).get("values", [])
+            if values:
+                return values[0].get("value")
+        except (AttributeError, IndexError, TypeError):
+            pass
+        return None
+
+    async def get_sma(self, symbol: str, window: int = 50,
+                      timespan: str = "day", limit: int = 1) -> float | None:
+        """Get SMA from Polygon's technical indicators endpoint.
+
+        Returns the most recent SMA value, or None on failure.
+        """
+        data = await self._request(
+            f"/v1/indicators/sma/{symbol}",
+            {"timespan": timespan, "window": window, "limit": limit,
+             "series_type": "close", "order": "desc"},
+        )
+        if not data:
+            return None
+        try:
+            values = data.get("results", {}).get("values", [])
+            if values:
+                return values[0].get("value")
+        except (AttributeError, IndexError, TypeError):
+            pass
+        return None
+
+    async def get_macd(self, symbol: str, timespan: str = "day",
+                       limit: int = 1) -> dict | None:
+        """Get MACD from Polygon's technical indicators endpoint.
+
+        Returns {value, signal, histogram} or None on failure.
+        """
+        data = await self._request(
+            f"/v1/indicators/macd/{symbol}",
+            {"timespan": timespan, "limit": limit,
+             "short_window": 12, "long_window": 26, "signal_window": 9,
+             "series_type": "close", "order": "desc"},
+        )
+        if not data:
+            return None
+        try:
+            values = data.get("results", {}).get("values", [])
+            if values:
+                v = values[0]
+                return {
+                    "value": v.get("value"),
+                    "signal": v.get("signal"),
+                    "histogram": v.get("histogram"),
+                }
+        except (AttributeError, IndexError, TypeError):
+            pass
+        return None
+
+    async def get_snapshot(self, symbol: str) -> dict | None:
+        """Get real-time snapshot (15-min delayed on Starter tier).
+
+        Returns current price, day change, volume, bid/ask, etc.
+        """
+        data = await self._request(
+            f"/v2/snapshot/locale/us/markets/stocks/tickers/{symbol}", {},
+        )
+        if not data or "ticker" not in data:
+            return None
+
+        t = data["ticker"]
+        day = t.get("day", {})
+        prev = t.get("prevDay", {})
+        last_trade = t.get("lastTrade", {})
+        last_quote = t.get("lastQuote", {})
+
+        return {
+            "symbol": t.get("ticker"),
+            "last_price": last_trade.get("p"),
+            "last_size": last_trade.get("s"),
+            "bid": last_quote.get("p"),
+            "ask": last_quote.get("P"),
+            "bid_size": last_quote.get("s"),
+            "ask_size": last_quote.get("S"),
+            "day_open": day.get("o"),
+            "day_high": day.get("h"),
+            "day_low": day.get("l"),
+            "day_close": day.get("c"),
+            "day_volume": day.get("v"),
+            "day_vwap": day.get("vw"),
+            "prev_close": prev.get("c"),
+            "prev_volume": prev.get("v"),
+            "change": (day.get("c", 0) - prev.get("c", 0)) if day.get("c") and prev.get("c") else None,
+            "change_pct": ((day.get("c", 0) / prev.get("c", 1)) - 1) if day.get("c") and prev.get("c") else None,
+        }
+
+    async def get_tickers(
+        self,
+        market: str = "stocks",
+        exchange: str | None = None,
+        type: str = "CS",
+        active: bool = True,
+        sort: str = "ticker",
+        order: str = "asc",
+        limit: int = 1000,
+        search: str | None = None,
+    ) -> list[dict]:
+        """Fetch tickers from /v3/reference/tickers with cursor pagination.
+
+        Returns a flat list of ticker dicts with fields:
+        ticker, name, market_cap, primary_exchange, type, active,
+        locale, currency_name, last_updated_utc, etc.
+        """
+        params = {
+            "market": market,
+            "type": type,
+            "active": str(active).lower(),
+            "sort": sort,
+            "order": order,
+            "limit": limit,
+        }
+        if exchange:
+            params["exchange"] = exchange
+        if search:
+            params["search"] = search
+
+        all_tickers: list[dict] = []
+        next_url: str | None = None
+        page = 1
+
+        while True:
+            if next_url:
+                # Cursor pagination — next_url is a full URL, just append apiKey
+                data = await self._request_url(next_url)
+            else:
+                data = await self._request("/v3/reference/tickers", params)
+
+            if not data:
+                break
+
+            results = data.get("results", [])
+            all_tickers.extend(results)
+            _log.info("Polygon tickers page %d: got %d tickers (total so far: %d)",
+                       page, len(results), len(all_tickers))
+
+            # Check for next page cursor
+            next_url = data.get("next_url")
+            if not next_url or not results:
+                break
+            page += 1
+
+        return all_tickers
+
+    async def get_all_snapshots(self) -> list[dict] | None:
+        """Get snapshots of ALL US stock tickers in one call.
+
+        Returns a list of snapshot dicts with current price, volume, day change.
+        Useful for bulk market cap / price lookups during universe refresh.
+        """
+        data = await self._request(
+            "/v2/snapshot/locale/us/markets/stocks/tickers", {},
+        )
+        if not data or "tickers" not in data:
+            return None
+
+        results = []
+        for t in data["tickers"]:
+            day = t.get("day", {})
+            prev = t.get("prevDay", {})
+            results.append({
+                "ticker": t.get("ticker"),
+                "last_price": t.get("lastTrade", {}).get("p"),
+                "day_volume": day.get("v"),
+                "day_close": day.get("c"),
+                "prev_close": prev.get("c"),
+                "change_pct": t.get("todaysChangePerc"),
+            })
+        _log.info("Polygon snapshots: got %d ticker snapshots", len(results))
+        return results
+
     async def _request(self, path: str, params: dict) -> dict | None:
         """Make a rate-limited request to Polygon API."""
         now = time.monotonic()
@@ -184,17 +410,49 @@ class PolygonClient:
                 resp = await client.get(url, params=params)
 
                 if resp.status_code == 429:
-                    _log.warning("event=polygon_rate_limited path=%s", path)
-                    await asyncio.sleep(5)
+                    _log.warning("Polygon 429 rate-limited on %s — retrying in 2s", path)
+                    await asyncio.sleep(2)
                     resp = await client.get(url, params=params)
 
                 if resp.status_code != 200:
-                    _log.warning("event=polygon_error path=%s status=%d", path, resp.status_code)
+                    _log.warning("Polygon HTTP %d on %s", resp.status_code, path)
                     return None
 
-                return resp.json()
+                data = resp.json()
+                _log.debug("Polygon %s → %d bytes", path, len(resp.content))
+                return data
         except Exception as exc:
-            _log.error("event=polygon_request_failed path=%s error=%s", path, exc)
+            _log.error("Polygon request failed %s — %s", path, exc)
+            return None
+
+    async def _request_url(self, url: str) -> dict | None:
+        """Make a rate-limited request to a full URL (for cursor pagination)."""
+        now = time.monotonic()
+        elapsed = now - self._last_request
+        if elapsed < self._min_interval:
+            await asyncio.sleep(self._min_interval - elapsed)
+        self._last_request = time.monotonic()
+
+        separator = "&" if "?" in url else "?"
+        full_url = f"{url}{separator}apiKey={self._api_key}"
+
+        try:
+            async with httpx.AsyncClient(timeout=30) as client:
+                resp = await client.get(full_url)
+
+                if resp.status_code == 429:
+                    _log.warning("Polygon 429 rate-limited on paginated URL — retrying in 2s")
+                    await asyncio.sleep(2)
+                    resp = await client.get(full_url)
+
+                if resp.status_code != 200:
+                    _log.warning("Polygon HTTP %d on paginated URL", resp.status_code)
+                    return None
+
+                data = resp.json()
+                return data
+        except Exception as exc:
+            _log.error("Polygon paginated request failed — %s", exc)
             return None
 
 

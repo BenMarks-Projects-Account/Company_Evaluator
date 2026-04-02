@@ -1,0 +1,101 @@
+﻿{
+    "ok":  true,
+    "symbol":  "AAPL",
+    "current_price":  null,
+    "roic_analysis":  {
+                          "roic":  0.6892,
+                          "roic_pct":  "68.9%",
+                          "nopat":  null,
+                          "invested_capital":  45192000000.0,
+                          "operating_income":  0,
+                          "tax_rate":  0.1654,
+                          "total_debt":  45192000000.0,
+                          "total_equity":  0,
+                          "cash":  0,
+                          "roic_source":  "finnhub_roiTTM"
+                      },
+    "wacc":  {
+                 "wacc":  0.1002,
+                 "wacc_pct":  "10.0%",
+                 "cost_of_equity":  0.101,
+                 "cost_of_debt":  0.035,
+                 "beta":  1.1093,
+                 "equity_weight":  0.9881,
+                 "debt_weight":  0.0119
+             },
+    "eva":  {
+                "value_spread":  0.589,
+                "value_spread_pct":  "58.9%",
+                "eva_annual":  26620094423.0,
+                "eva_per_share":  null,
+                "creates_value":  true
+            },
+    "quality":  {
+                    "grade":  "ELITE",
+                    "description":  "Exceptional value creator â earns far above cost of capital",
+                    "value_spread":  0.589,
+                    "value_spread_pct":  "58.9%",
+                    "signals":  [
+                                    {
+                                        "signal":  "ROE 160% â strong equity returns",
+                                        "direction":  "positive"
+                                    },
+                                    {
+                                        "signal":  "ROA 34% â efficient asset utilization",
+                                        "direction":  "positive"
+                                    },
+                                    {
+                                        "signal":  "Asset turnover 1.24x â efficient capital use",
+                                        "direction":  "positive"
+                                    },
+                                    {
+                                        "signal":  "Operating margin 32% â strong pricing power",
+                                        "direction":  "positive"
+                                    },
+                                    {
+                                        "signal":  "ROIC trending up (57% 5Y avg -\u003e 69% TTM)",
+                                        "direction":  "positive"
+                                    },
+                                    {
+                                        "signal":  "Interest coverage 623x â minimal debt burden",
+                                        "direction":  "positive"
+                                    }
+                                ],
+                    "score":  98
+                },
+    "implied_valuation":  {
+                              "ev_implied":  310979373067.0,
+                              "equity_value":  265787373067.0,
+                              "per_share":  null,
+                              "current_price":  null,
+                              "upside_pct":  null,
+                              "note":  "EVA perpetuity valuation â assumes current EVA is sustainable but does not grow"
+                          },
+    "comparison":  {
+                       "roic":  0.6892,
+                       "roic_pct":  "68.9%",
+                       "roe":  1.5994,
+                       "roe_pct":  "159.9%",
+                       "roa":  0.3362,
+                       "roa_pct":  "33.6%",
+                       "wacc":  0.1002,
+                       "wacc_pct":  "10.0%",
+                       "spread":  0.589,
+                       "spread_pct":  "58.9%"
+                   },
+    "verdict":  {
+                    "status":  "ELITE_VALUE_CREATOR",
+                    "value_creation":  "positive",
+                    "valuation":  "INSUFFICIENT_DATA",
+                    "summary":  "AAPL creates value with ROIC of 68.9% vs WACC of 10.0% (+58.9% spread). Insufficient data for implied valuation."
+                },
+    "confidence":  "HIGH",
+    "defaults_used":  [
+
+                      ],
+    "llm_available":  false,
+    "llm_analysis":  null,
+    "llm_recommendation":  null,
+    "analyzed_at":  "2026-04-02T02:07:15.895927+00:00",
+    "cached":  true
+}

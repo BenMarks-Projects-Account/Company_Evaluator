@@ -12,6 +12,8 @@ Metrics and inner-pillar weights:
 
 from __future__ import annotations
 
+import logging
+
 from metrics.helpers import (
     safe_div,
     score,
@@ -21,6 +23,8 @@ from metrics.helpers import (
     ttm_sum,
     latest,
 )
+
+_log = logging.getLogger(__name__)
 
 _BOUNDS = {
     "roic_wacc_spread": (-0.02, 0.20),   # −2 % → +20 %
@@ -126,6 +130,11 @@ def compute(data: dict) -> dict:
     }
 
     pillar = weighted_avg([(scores[k], _WEIGHTS[k]) for k in _WEIGHTS])
+
+    _log.info("    [CA] Final: spread=%s shares=%s payout=%s insider=%s rd=%s -> pillar=%.1f",
+              metrics["roic_wacc_spread"], metrics["share_trend"],
+              metrics.get("payout_ratio"), metrics.get("insider_net"),
+              metrics["rd_intensity"], pillar or 0)
 
     return {"pillar_score": pillar, "metrics": metrics, "scores": scores}
 
