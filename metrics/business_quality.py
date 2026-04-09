@@ -21,11 +21,13 @@ from metrics.helpers import (
     safe_div,
     score,
     weighted_avg,
+    apply_completeness_cap,
     get_statements,
     get_finnhub_metrics,
     ttm_sum,
     coeff_of_variation,
 )
+from metrics.validation import validate_pillar_metrics
 
 _log = logging.getLogger(__name__)
 
@@ -50,7 +52,7 @@ _WEIGHTS = {
 
 
 def compute(data: dict) -> dict:
-    """Return ``{pillar_score, metrics, scores}`` for Business Quality."""
+    """Return Business Quality scores from raw company data."""
     quarterly = get_statements(data, "quarterly")
     fh = get_finnhub_metrics(data)
     _log.info("    [BQ] Computing with %d quarterly statements, %d finnhub metrics",
@@ -131,16 +133,36 @@ def compute(data: dict) -> dict:
         "rev_stability": _r(rev_stability),
     }
 
-    scores = {k: score(metrics[k], *_BOUNDS[k]) for k in _BOUNDS}
+    return rescore_from_metrics(metrics, raw_metrics=metrics)
 
-    pillar = weighted_avg([(scores[k], _WEIGHTS[k]) for k in _WEIGHTS])
 
-    _log.info("    [BQ] Final: roic=%s gm=%s om=%s nm=%s fcf_y=%s rev_s=%s -> pillar=%.1f",
-              metrics["roic"], metrics["gross_margin"], metrics["op_margin"],
-              metrics["net_margin"], metrics["fcf_yield"], metrics["rev_stability"],
-              pillar or 0)
+def rescore_from_metrics(metrics: dict, raw_metrics: dict | None = None) -> dict:
+    """Re-score Business Quality from persisted metric values."""
+    raw_metrics = dict(raw_metrics or metrics)
+    validated_metrics, flags = validate_pillar_metrics(metrics)
+    for key in _BOUNDS:
+        validated_metrics.setdefault(key, None)
 
-    return {"pillar_score": pillar, "metrics": metrics, "scores": scores}
+    scores = {k: score(validated_metrics.get(k), *_BOUNDS[k]) for k in _BOUNDS}
+
+    raw_score, completeness_pct = weighted_avg([(scores[k], _WEIGHTS[k]) for k in _WEIGHTS])
+    pillar_score = apply_completeness_cap(raw_score, completeness_pct)
+
+    _log.info("    [BQ] Final: roic=%s gm=%s om=%s nm=%s fcf_y=%s rev_s=%s -> raw=%.1f pillar=%.1f completeness=%.1f%%",
+              validated_metrics["roic"], validated_metrics["gross_margin"], validated_metrics["op_margin"],
+              validated_metrics["net_margin"], validated_metrics["fcf_yield"], validated_metrics["rev_stability"],
+              raw_score, pillar_score, completeness_pct)
+
+    return {
+        "pillar_score": pillar_score,
+        "raw_score": raw_score,
+        "completeness_pct": completeness_pct,
+        "raw_metrics": raw_metrics,
+        "metrics": validated_metrics,
+        "scores": scores,
+        "data_quality_flags": flags,
+        "cap_applied": pillar_score != raw_score,
+    }
 
 
 def _r(v, decimals=4):

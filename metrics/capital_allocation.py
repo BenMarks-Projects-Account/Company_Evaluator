@@ -18,11 +18,13 @@ from metrics.helpers import (
     safe_div,
     score,
     weighted_avg,
+    apply_completeness_cap,
     get_statements,
     get_finnhub_metrics,
     ttm_sum,
     latest,
 )
+from metrics.validation import validate_pillar_metrics
 
 _log = logging.getLogger(__name__)
 
@@ -121,22 +123,44 @@ def compute(data: dict) -> dict:
         "roic":             _r(roic),
     }
 
+    return rescore_from_metrics(metrics, raw_metrics=metrics)
+
+
+def rescore_from_metrics(metrics: dict, raw_metrics: dict | None = None) -> dict:
+    """Re-score Capital Allocation from persisted metric values."""
+    raw_metrics = dict(raw_metrics or metrics)
+    validated_metrics, flags = validate_pillar_metrics(metrics)
+    for key in ("roic_wacc_spread", "share_trend", "payout_ratio", "rd_intensity", "insider_net", "wacc_est", "roic"):
+        validated_metrics.setdefault(key, None)
+    payout_ratio = validated_metrics.get("payout_ratio")
+    payout_pct = payout_ratio * 100 if payout_ratio is not None else None
+
     scores = {
-        "roic_wacc_spread": score(spread, -0.02, 0.20),
-        "share_trend":      score(share_trend, -0.05, 0.05, invert=True),
-        "dividend_sustain": div_score,
-        "insider_activity": insider_score,
-        "rd_intensity":     score(rd_intensity, 0.0, 0.15),
+        "roic_wacc_spread": score(validated_metrics.get("roic_wacc_spread"), -0.02, 0.20),
+        "share_trend":      score(validated_metrics.get("share_trend"), -0.05, 0.05, invert=True),
+        "dividend_sustain": _score_payout(payout_pct),
+        "insider_activity": _score_insiders({"net_activity": validated_metrics.get("insider_net", "unknown")}),
+        "rd_intensity":     score(validated_metrics.get("rd_intensity"), 0.0, 0.15),
     }
 
-    pillar = weighted_avg([(scores[k], _WEIGHTS[k]) for k in _WEIGHTS])
+    raw_score, completeness_pct = weighted_avg([(scores[k], _WEIGHTS[k]) for k in _WEIGHTS])
+    pillar_score = apply_completeness_cap(raw_score, completeness_pct)
 
-    _log.info("    [CA] Final: spread=%s shares=%s payout=%s insider=%s rd=%s -> pillar=%.1f",
-              metrics["roic_wacc_spread"], metrics["share_trend"],
-              metrics.get("payout_ratio"), metrics.get("insider_net"),
-              metrics["rd_intensity"], pillar or 0)
+    _log.info("    [CA] Final: spread=%s shares=%s payout=%s insider=%s rd=%s -> raw=%.1f pillar=%.1f completeness=%.1f%%",
+              validated_metrics["roic_wacc_spread"], validated_metrics["share_trend"],
+              validated_metrics.get("payout_ratio"), validated_metrics.get("insider_net"),
+              validated_metrics["rd_intensity"], raw_score, pillar_score, completeness_pct)
 
-    return {"pillar_score": pillar, "metrics": metrics, "scores": scores}
+    return {
+        "pillar_score": pillar_score,
+        "raw_score": raw_score,
+        "completeness_pct": completeness_pct,
+        "raw_metrics": raw_metrics,
+        "metrics": validated_metrics,
+        "scores": scores,
+        "data_quality_flags": flags,
+        "cap_applied": pillar_score != raw_score,
+    }
 
 
 def _score_payout(payout_pct: float | None) -> float | None:

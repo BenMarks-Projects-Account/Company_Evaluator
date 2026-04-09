@@ -1,15 +1,17 @@
 """Full evaluation pipeline: data → metrics → score → store."""
 
+import json
 import logging
 import time
 from datetime import datetime, timezone
 from data.company_data_service import CompanyDataService
-from metrics.composite import compute_composite_score
+from metrics.composite import compute_composite_score, recompute_composite_from_metrics
 from analysis.company_analyst import analyze_company
 from db.database import get_session, CompanyEvaluation, EvaluationHistory
 from sqlalchemy import select
 
 _log = logging.getLogger(__name__)
+SCORING_VERSION = "0.2.0"
 
 _data_service = None
 
@@ -21,7 +23,7 @@ def _get_data_service():
     return _data_service
 
 
-async def evaluate_company(symbol: str) -> dict:
+async def evaluate_company(symbol: str, force: bool = False) -> dict:
     """Full evaluation: fetch → compute → store → return."""
     symbol = symbol.upper()
     t0 = time.time()
@@ -111,6 +113,8 @@ async def evaluate_company(symbol: str) -> dict:
     # Step 4: Store in database
     _log.info("[%s] Step 4/5: Saving to database...", symbol)
     t4 = time.time()
+    raw_financials_snapshot = _build_raw_financials_snapshot(company_data, scores)
+    structured_errors = _build_errors_snapshot(company_data, scores)
     async with get_session() as session:
         # Upsert — update existing or insert new
         existing = await session.execute(
@@ -154,6 +158,9 @@ async def evaluate_company(symbol: str) -> dict:
 
         eval_record.evaluated_at = datetime.now(timezone.utc)
         eval_record.data_freshness = company_data.get("data_quality")
+        eval_record.evaluation_version = SCORING_VERSION
+        eval_record.raw_financials = raw_financials_snapshot
+        eval_record.errors = structured_errors
 
         # Also write to history
         history = EvaluationHistory(
@@ -191,11 +198,166 @@ async def evaluate_company(symbol: str) -> dict:
         "company_name": profile.get("company_name"),
         "sector": profile.get("sector"),
         "data_quality": company_data.get("data_quality"),
+        "overall_completeness_pct": scores.get("overall_completeness_pct"),
+        "missing_pillar_count": scores.get("missing_pillar_count"),
+        "data_quality_flags": scores.get("data_quality_flags", []),
+        "force": force,
     }
     if llm_result:
         result["llm_analysis"] = llm_result
 
     return result
+
+
+def _detail_to_dict(detail):
+    if detail is None:
+        return {}
+    if isinstance(detail, dict):
+        return detail
+    if isinstance(detail, str):
+        try:
+            return json.loads(detail)
+        except json.JSONDecodeError:
+            return {}
+    return {}
+
+
+def _build_raw_financials_snapshot(company_data: dict, scores: dict) -> dict:
+    payload = {
+        "symbol": company_data.get("symbol"),
+        "profile": company_data.get("profile"),
+        "financials_quarterly": company_data.get("financials_quarterly"),
+        "financials_annual": company_data.get("financials_annual"),
+        "basic_financials": company_data.get("basic_financials"),
+        "price_history": company_data.get("price_history"),
+        "eps_estimates": company_data.get("eps_estimates"),
+        "price_target": company_data.get("price_target"),
+        "insider_transactions": company_data.get("insider_transactions"),
+        "peers": company_data.get("peers"),
+        "analyst_recommendations": company_data.get("analyst_recommendations"),
+        "sources_used": company_data.get("sources_used"),
+        "data_quality": company_data.get("data_quality"),
+    }
+    return {
+        "fetched_at": company_data.get("fetched_at"),
+        "evaluation_version": SCORING_VERSION,
+        "sources": company_data.get("source_attribution", {}),
+        "company_data": payload,
+        "computed_inputs": {
+            "biz_quality": _detail_to_dict(scores.get("pillar_details", {}).get("business_quality")).get("raw_metrics", {}),
+            "ops_health": _detail_to_dict(scores.get("pillar_details", {}).get("operational_health")).get("raw_metrics", {}),
+            "cap_allocation": _detail_to_dict(scores.get("pillar_details", {}).get("capital_allocation")).get("raw_metrics", {}),
+            "growth": _detail_to_dict(scores.get("pillar_details", {}).get("growth_quality")).get("raw_metrics", {}),
+            "valuation": _detail_to_dict(scores.get("pillar_details", {}).get("valuation")).get("raw_metrics", {}),
+        },
+    }
+
+
+def _build_errors_snapshot(company_data: dict, scores: dict) -> dict:
+    fetch_errors = company_data.get("fetch_errors") or []
+    data_quality_flags = [
+        {**flag, "action": "rejected_treated_as_missing"}
+        for flag in (scores.get("data_quality_flags") or [])
+    ]
+
+    missing_data_warnings = []
+    for pillar_name, pillar_detail in (scores.get("pillar_details") or {}).items():
+        completeness_pct = pillar_detail.get("completeness_pct", 0.0) or 0.0
+        if completeness_pct < 50:
+            missing_data_warnings.append(
+                f"{pillar_name} has < 50% data completeness ({completeness_pct:.1f}%)"
+            )
+
+    payload = {
+        "fetch_errors": fetch_errors,
+        "data_quality_flags": data_quality_flags,
+        "missing_data_warnings": missing_data_warnings,
+        "computational_errors": [],
+    }
+
+    if not any(payload.values()):
+        return {}
+    return payload
+
+
+def _stored_pillar_metrics(company: CompanyEvaluation) -> dict[str, dict]:
+    detail_map = {
+        "business_quality": company.pillar_1_detail,
+        "operational_health": company.pillar_2_detail,
+        "capital_allocation": company.pillar_3_detail,
+        "growth_quality": company.pillar_4_detail,
+        "valuation": company.pillar_5_detail,
+    }
+    output = {}
+    for name, detail in detail_map.items():
+        metrics = _detail_to_dict(detail).get("metrics", {})
+        output[name] = metrics if isinstance(metrics, dict) else {}
+    return output
+
+
+async def rerank_existing_evaluations() -> dict:
+    """Re-score and rerank existing evaluations using stored pillar metrics only."""
+    async with get_session() as session:
+        result = await session.execute(select(CompanyEvaluation))
+        companies = result.scalars().all()
+
+        for company in companies:
+            scores = recompute_composite_from_metrics(
+                _stored_pillar_metrics(company),
+                company.data_freshness or "unknown",
+            )
+
+            pillar_scores = scores.get("pillar_scores", {})
+            pillar_details = scores.get("pillar_details", {})
+
+            company.composite_score = scores.get("composite_score")
+            company.pillar_1_business_quality = pillar_scores.get("business_quality")
+            company.pillar_2_operational_health = pillar_scores.get("operational_health")
+            company.pillar_3_capital_allocation = pillar_scores.get("capital_allocation")
+            company.pillar_4_growth_quality = pillar_scores.get("growth_quality")
+            company.pillar_5_valuation = pillar_scores.get("valuation")
+            company.pillar_1_detail = pillar_details.get("business_quality")
+            company.pillar_2_detail = pillar_details.get("operational_health")
+            company.pillar_3_detail = pillar_details.get("capital_allocation")
+            company.pillar_4_detail = pillar_details.get("growth_quality")
+            company.pillar_5_detail = pillar_details.get("valuation")
+            company.evaluation_version = SCORING_VERSION
+            existing_errors = _detail_to_dict(company.errors)
+            company.errors = {
+                "fetch_errors": existing_errors.get("fetch_errors", []),
+                "data_quality_flags": [
+                    {**flag, "action": "rejected_treated_as_missing"}
+                    for flag in (scores.get("data_quality_flags") or [])
+                ],
+                "missing_data_warnings": [
+                    f"{pillar_name} has < 50% data completeness ({(detail.get('completeness_pct', 0.0) or 0.0):.1f}%)"
+                    for pillar_name, detail in (scores.get("pillar_details") or {}).items()
+                    if (detail.get("completeness_pct", 0.0) or 0.0) < 50
+                ],
+                "computational_errors": existing_errors.get("computational_errors", []),
+            }
+
+        ranked = sorted(
+            companies,
+            key=lambda company: (company.composite_score is not None, company.composite_score or 0.0),
+            reverse=True,
+        )
+        for index, company in enumerate(ranked, 1):
+            company.rank = index
+
+        await session.commit()
+
+    flagged = sum(
+        1
+        for company in companies
+        if _detail_to_dict(company.errors).get("fetch_errors") or _detail_to_dict(company.errors).get("data_quality_flags")
+    )
+    return {
+        "status": "ok",
+        "updated": len(companies),
+        "flagged_companies": flagged,
+        "scoring_version": SCORING_VERSION,
+    }
 
 
 async def _update_rankings():

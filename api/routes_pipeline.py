@@ -93,3 +93,11 @@ async def evaluate_single_company(symbol: str):
     from pipeline.evaluator import evaluate_company
     result = await evaluate_company(symbol.upper())
     return result
+
+
+@router.post("/universe/rerank")
+async def rerank_universe_scores():
+    """Re-score and rerank existing evaluations from stored pillar metrics."""
+    from pipeline.evaluator import rerank_existing_evaluations
+
+    return await rerank_existing_evaluations()

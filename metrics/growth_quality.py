@@ -18,10 +18,12 @@ from metrics.helpers import (
     safe_div,
     score,
     weighted_avg,
+    apply_completeness_cap,
     get_statements,
     get_finnhub_metrics,
     cagr,
 )
+from metrics.validation import validate_pillar_metrics
 
 _log = logging.getLogger(__name__)
 
@@ -89,22 +91,42 @@ def compute(data: dict) -> dict:
         "margin_trend":    _r(margin_trend),
     }
 
+    return rescore_from_metrics(metrics, raw_metrics=metrics)
+
+
+def rescore_from_metrics(metrics: dict, raw_metrics: dict | None = None) -> dict:
+    """Re-score Growth Quality from persisted metric values."""
+    raw_metrics = dict(raw_metrics or metrics)
+    validated_metrics, flags = validate_pillar_metrics(metrics)
+    for key in ("revenue_cagr_3y", "revenue_cagr_5y", "fcf_growth", "eps_growth_yoy", "margin_trend"):
+        validated_metrics.setdefault(key, None)
+
     scores_dict = {
-        "revenue_cagr_3y": score(rev_3y, *_BOUNDS["revenue_cagr_3y"]),
-        "revenue_cagr_5y": score(rev_5y, *_BOUNDS["revenue_cagr_5y"]),
-        "fcf_growth":      score(fcf_cagr, *_BOUNDS["fcf_growth"]),
-        "eps_growth":      score(eps_growth, *_BOUNDS["eps_growth"]),
-        "margin_trend":    score(margin_trend, *_BOUNDS["margin_trend"]),
+        "revenue_cagr_3y": score(validated_metrics.get("revenue_cagr_3y"), *_BOUNDS["revenue_cagr_3y"]),
+        "revenue_cagr_5y": score(validated_metrics.get("revenue_cagr_5y"), *_BOUNDS["revenue_cagr_5y"]),
+        "fcf_growth":      score(validated_metrics.get("fcf_growth"), *_BOUNDS["fcf_growth"]),
+        "eps_growth":      score(validated_metrics.get("eps_growth_yoy"), *_BOUNDS["eps_growth"]),
+        "margin_trend":    score(validated_metrics.get("margin_trend"), *_BOUNDS["margin_trend"]),
     }
 
-    pillar = weighted_avg([(scores_dict[k], _WEIGHTS[k]) for k in _WEIGHTS])
+    raw_score, completeness_pct = weighted_avg([(scores_dict[k], _WEIGHTS[k]) for k in _WEIGHTS])
+    pillar_score = apply_completeness_cap(raw_score, completeness_pct)
 
-    _log.info("    [GQ] Final: rev3y=%s rev5y=%s fcf=%s eps=%s margin=%s -> pillar=%.1f",
-              metrics["revenue_cagr_3y"], metrics["revenue_cagr_5y"],
-              metrics["fcf_growth"], metrics["eps_growth_yoy"],
-              metrics["margin_trend"], pillar or 0)
+    _log.info("    [GQ] Final: rev3y=%s rev5y=%s fcf=%s eps=%s margin=%s -> raw=%.1f pillar=%.1f completeness=%.1f%%",
+              validated_metrics["revenue_cagr_3y"], validated_metrics["revenue_cagr_5y"],
+              validated_metrics["fcf_growth"], validated_metrics["eps_growth_yoy"],
+              validated_metrics["margin_trend"], raw_score, pillar_score, completeness_pct)
 
-    return {"pillar_score": pillar, "metrics": metrics, "scores": scores_dict}
+    return {
+        "pillar_score": pillar_score,
+        "raw_score": raw_score,
+        "completeness_pct": completeness_pct,
+        "raw_metrics": raw_metrics,
+        "metrics": validated_metrics,
+        "scores": scores_dict,
+        "data_quality_flags": flags,
+        "cap_applied": pillar_score != raw_score,
+    }
 
 
 def _annual_cagr(annual: list[dict], field: str, years: int) -> float | None:

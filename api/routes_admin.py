@@ -60,6 +60,14 @@ async def get_universe_list():
     }
 
 
+@router.post("/admin/backfill/{symbol}")
+async def backfill_raw_data(symbol: str):
+    """Re-evaluate one symbol to populate raw_financials and errors."""
+    from pipeline.evaluator import evaluate_company
+
+    return await evaluate_company(symbol.upper(), force=True)
+
+
 class UniverseAddRequest(BaseModel):
     symbols: list[str]
     source: str = "manual"

@@ -19,11 +19,13 @@ from metrics.helpers import (
     safe_div,
     score,
     weighted_avg,
+    apply_completeness_cap,
     get_statements,
     get_finnhub_metrics,
     ttm_sum,
     latest,
 )
+from metrics.validation import validate_pillar_metrics
 
 _log = logging.getLogger(__name__)
 
@@ -127,18 +129,38 @@ def compute(data: dict) -> dict:
         "altman_z":          _r(altman_z),
     }
 
+    return rescore_from_metrics(metrics, raw_metrics=metrics)
+
+
+def rescore_from_metrics(metrics: dict, raw_metrics: dict | None = None) -> dict:
+    """Re-score Operational Health from persisted metric values."""
+    raw_metrics = dict(raw_metrics or metrics)
+    validated_metrics, flags = validate_pillar_metrics(metrics)
+    for key in _BOUNDS:
+        validated_metrics.setdefault(key, None)
+
     scores = {}
     for k in _BOUNDS:
-        scores[k] = score(metrics[k], *_BOUNDS[k], invert=(k in _INVERTED))
+        scores[k] = score(validated_metrics.get(k), *_BOUNDS[k], invert=(k in _INVERTED))
 
-    pillar = weighted_avg([(scores[k], _WEIGHTS[k]) for k in _WEIGHTS])
+    raw_score, completeness_pct = weighted_avg([(scores[k], _WEIGHTS[k]) for k in _WEIGHTS])
+    pillar_score = apply_completeness_cap(raw_score, completeness_pct)
 
-    _log.info("    [OH] Final: sga=%s d/ebitda=%s int_cov=%s cur_r=%s cash_c=%s alt_z=%s -> pillar=%.1f",
-              metrics["sga_efficiency"], metrics["debt_to_ebitda"], metrics["interest_coverage"],
-              metrics["current_ratio"], metrics["cash_conversion"], metrics["altman_z"],
-              pillar or 0)
+    _log.info("    [OH] Final: sga=%s d/ebitda=%s int_cov=%s cur_r=%s cash_c=%s alt_z=%s -> raw=%.1f pillar=%.1f completeness=%.1f%%",
+              validated_metrics["sga_efficiency"], validated_metrics["debt_to_ebitda"], validated_metrics["interest_coverage"],
+              validated_metrics["current_ratio"], validated_metrics["cash_conversion"], validated_metrics["altman_z"],
+              raw_score, pillar_score, completeness_pct)
 
-    return {"pillar_score": pillar, "metrics": metrics, "scores": scores}
+    return {
+        "pillar_score": pillar_score,
+        "raw_score": raw_score,
+        "completeness_pct": completeness_pct,
+        "raw_metrics": raw_metrics,
+        "metrics": validated_metrics,
+        "scores": scores,
+        "data_quality_flags": flags,
+        "cap_applied": pillar_score != raw_score,
+    }
 
 
 def _r(v, decimals=4):

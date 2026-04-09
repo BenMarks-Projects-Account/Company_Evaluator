@@ -2,6 +2,7 @@
 
 import asyncio
 import logging
+from datetime import datetime, timezone
 from config import get_settings
 
 _log = logging.getLogger(__name__)
@@ -40,6 +41,9 @@ class CompanyDataService:
         t0 = time.time()
         _log.info("[%s] DATA: Begin fetching from all sources...", symbol)
         yahoo_used = False
+        fetched_at = datetime.now(timezone.utc).isoformat()
+        source_attribution: dict[str, dict] = {}
+        fetch_errors: list[dict] = []
 
         # === POLYGON: Financial statements + price history ===
         financials_quarterly = None
@@ -52,21 +56,37 @@ class CompanyDataService:
             financials_quarterly = await self._safe(
                 "polygon_financials_q",
                 self._polygon.get_financials, symbol, limit=12, timeframe="quarterly",
+                provider="polygon",
+                endpoint="/vX/reference/financials",
+                source_attribution=source_attribution,
+                fetch_errors=fetch_errors,
             )
             _log.info("[%s] DATA: Fetching Polygon annual financials...", symbol)
             financials_annual = await self._safe(
                 "polygon_financials_a",
                 self._polygon.get_financials, symbol, limit=8, timeframe="annual",
+                provider="polygon",
+                endpoint="/vX/reference/financials",
+                source_attribution=source_attribution,
+                fetch_errors=fetch_errors,
             )
             _log.info("[%s] DATA: Fetching Polygon price history...", symbol)
             price_history = await self._safe(
                 "polygon_prices",
                 self._polygon.get_price_history, symbol, days=365,
+                provider="polygon",
+                endpoint="/v2/aggs/ticker/{symbol}/range/1/day",
+                source_attribution=source_attribution,
+                fetch_errors=fetch_errors,
             )
             _log.info("[%s] DATA: Fetching Polygon company details...", symbol)
             company_details = await self._safe(
                 "polygon_details",
                 self._polygon.get_company_details, symbol,
+                provider="polygon",
+                endpoint="/v3/reference/tickers/{symbol}",
+                source_attribution=source_attribution,
+                fetch_errors=fetch_errors,
             )
 
         # === FINNHUB: Ratios, estimates, insiders, peers ===
@@ -82,30 +102,58 @@ class CompanyDataService:
             _log.info("[%s] DATA: Fetching Finnhub basic financials (117 ratios)...", symbol)
             basic_financials = await self._safe(
                 "finnhub_metrics", self._finnhub.get_basic_financials, symbol,
+                provider="finnhub",
+                endpoint="/stock/metric",
+                source_attribution=source_attribution,
+                fetch_errors=fetch_errors,
             )
             _log.info("[%s] DATA: Fetching Finnhub company profile...", symbol)
             profile = await self._safe(
                 "finnhub_profile", self._finnhub.get_company_profile, symbol,
+                provider="finnhub",
+                endpoint="/stock/profile2",
+                source_attribution=source_attribution,
+                fetch_errors=fetch_errors,
             )
             _log.info("[%s] DATA: Fetching Finnhub EPS estimates...", symbol)
             eps_estimates = await self._safe(
                 "finnhub_estimates", self._finnhub.get_eps_estimates, symbol,
+                provider="finnhub",
+                endpoint="/stock/eps-estimate",
+                source_attribution=source_attribution,
+                fetch_errors=fetch_errors,
             )
             _log.info("[%s] DATA: Fetching Finnhub price target...", symbol)
             price_target = await self._safe(
                 "finnhub_target", self._finnhub.get_price_target, symbol,
+                provider="finnhub",
+                endpoint="/stock/price-target",
+                source_attribution=source_attribution,
+                fetch_errors=fetch_errors,
             )
             _log.info("[%s] DATA: Fetching Finnhub insider transactions...", symbol)
             insiders = await self._safe(
                 "finnhub_insiders", self._finnhub.get_insider_transactions, symbol,
+                provider="finnhub",
+                endpoint="/stock/insider-transactions",
+                source_attribution=source_attribution,
+                fetch_errors=fetch_errors,
             )
             _log.info("[%s] DATA: Fetching Finnhub peers...", symbol)
             peers = await self._safe(
                 "finnhub_peers", self._finnhub.get_peers, symbol,
+                provider="finnhub",
+                endpoint="/stock/peers",
+                source_attribution=source_attribution,
+                fetch_errors=fetch_errors,
             )
             _log.info("[%s] DATA: Fetching Finnhub recommendations...", symbol)
             recommendations = await self._safe(
                 "finnhub_recs", self._finnhub.get_recommendation_trends, symbol,
+                provider="finnhub",
+                endpoint="/stock/recommendation",
+                source_attribution=source_attribution,
+                fetch_errors=fetch_errors,
             )
 
         # === YAHOO FALLBACK: Only if critical data is missing ===
@@ -115,10 +163,24 @@ class CompanyDataService:
                 yahoo_data = await self._fetch_yahoo_fallback(symbol)
                 if yahoo_data:
                     yahoo_used = True
+                    source_attribution["yahoo_fallback"] = {
+                        "provider": "yahoo",
+                        "endpoint": "yfinance",
+                        "fetched_at": datetime.now(timezone.utc).isoformat(),
+                        "ok": True,
+                        "used": True,
+                    }
                     if not financials_quarterly or financials_quarterly.get("error"):
                         financials_quarterly = yahoo_data.get("income_statement")
                     if not price_history or price_history.get("error"):
                         price_history = yahoo_data.get("price_history")
+                else:
+                    fetch_errors.append({
+                        "source": "yahoo",
+                        "endpoint": "yfinance",
+                        "error": "Yahoo fallback returned no data",
+                        "timestamp": datetime.now(timezone.utc).isoformat(),
+                    })
 
         # === MERGE PROFILE from best source ===
         merged_profile = self._merge_profile(company_details, profile)
@@ -126,6 +188,7 @@ class CompanyDataService:
         # === BUILD UNIFIED RESULT ===
         result = {
             "symbol": symbol,
+            "fetched_at": fetched_at,
             "profile": merged_profile,
             "financials_quarterly": financials_quarterly,
             "financials_annual": financials_annual,
@@ -141,6 +204,8 @@ class CompanyDataService:
                 "finnhub": self._finnhub is not None,
                 "yahoo_fallback": yahoo_used,
             },
+            "source_attribution": source_attribution,
+            "fetch_errors": fetch_errors,
             "data_quality": self._assess_quality(financials_quarterly, basic_financials, price_history),
         }
 
@@ -213,20 +278,60 @@ class CompanyDataService:
             return "partial"
         return "degraded"
 
-    async def _safe(self, name: str, func, *args, **kwargs):
+    async def _safe(
+        self,
+        name: str,
+        func,
+        *args,
+        provider: str | None = None,
+        endpoint: str | None = None,
+        source_attribution: dict | None = None,
+        fetch_errors: list | None = None,
+        **kwargs,
+    ):
         """Call a data fetch function with error handling."""
         import time
         t = time.time()
+        fetched_at = datetime.now(timezone.utc).isoformat()
         try:
             result = await func(*args, **kwargs)
             elapsed = time.time() - t
+            ok = not (isinstance(result, dict) and result.get("error"))
+            if source_attribution is not None:
+                source_attribution[name] = {
+                    "provider": provider,
+                    "endpoint": endpoint,
+                    "fetched_at": fetched_at,
+                    "ok": ok,
+                }
             if isinstance(result, dict) and result.get("error"):
                 _log.warning("  └─ %s: FAILED in %.1fs — %s", name, elapsed, result["error"])
+                if fetch_errors is not None:
+                    fetch_errors.append({
+                        "source": provider,
+                        "endpoint": endpoint,
+                        "error": result["error"],
+                        "timestamp": fetched_at,
+                    })
             else:
                 _log.info("  └─ %s: OK in %.1fs", name, elapsed)
             return result
         except Exception as exc:
             _log.warning("  └─ %s: EXCEPTION in %.1fs — %s", name, time.time() - t, exc)
+            if source_attribution is not None:
+                source_attribution[name] = {
+                    "provider": provider,
+                    "endpoint": endpoint,
+                    "fetched_at": fetched_at,
+                    "ok": False,
+                }
+            if fetch_errors is not None:
+                fetch_errors.append({
+                    "source": provider,
+                    "endpoint": endpoint,
+                    "error": str(exc),
+                    "timestamp": fetched_at,
+                })
             return {"error": str(exc)}
 
     async def _fetch_yahoo_fallback(self, symbol: str) -> dict | None:

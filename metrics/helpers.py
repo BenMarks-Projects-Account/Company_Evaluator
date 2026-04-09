@@ -27,21 +27,37 @@ def score(value, low, high, invert=False):
     return round(raw * 100, 1)
 
 
-def weighted_avg(items: list[tuple[float | None, float]]) -> float | None:
-    """Weighted average ignoring None values, re-normalising weights.
+def weighted_avg(items: list[tuple[float | None, float]]) -> tuple[float, float]:
+    """Weighted average that penalizes missing values.
 
-    *items* is a list of (score, weight) tuples.
-    Returns None when no scored items are available.
+    Missing scores contribute 0 to the numerator while still counting in the
+    denominator, so sparse data lowers the final score instead of being
+    re-normalized away.
     """
-    total_w = 0.0
-    total_v = 0.0
-    for val, w in items:
-        if val is not None:
-            total_w += w
-            total_v += val * w
-    if total_w == 0:
-        return None
-    return round(total_v / total_w, 1)
+    if not items:
+        return 0.0, 0.0
+
+    total_weight = sum(weight for _, weight in items)
+    if total_weight == 0:
+        return 0.0, 0.0
+
+    populated_weight = sum(weight for score_value, weight in items if score_value is not None)
+    populated_score = sum(score_value * weight for score_value, weight in items if score_value is not None)
+
+    final_score = populated_score / total_weight
+    completeness_pct = (populated_weight / total_weight) * 100
+    return round(final_score, 1), round(completeness_pct, 1)
+
+
+def apply_completeness_cap(score_value: float, completeness_pct: float) -> float:
+    """Cap pillar scores when data completeness is low."""
+    if completeness_pct < 30:
+        return min(score_value, 40.0)
+    if completeness_pct < 50:
+        return min(score_value, 60.0)
+    if completeness_pct < 70:
+        return min(score_value, 80.0)
+    return score_value
 
 
 def get_statements(data: dict, timeframe: str = "quarterly") -> list[dict]:

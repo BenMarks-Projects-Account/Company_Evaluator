@@ -19,11 +19,13 @@ from metrics.helpers import (
     safe_div,
     score,
     weighted_avg,
+    apply_completeness_cap,
     get_statements,
     get_finnhub_metrics,
     ttm_sum,
     latest,
 )
+from metrics.validation import validate_pillar_metrics
 
 _log = logging.getLogger(__name__)
 
@@ -87,22 +89,59 @@ def compute(data: dict) -> dict:
         "analyst_strong_sell": recs.get("strong_sell"),
     }
 
-    scores = {
-        "ev_ebitda":         score(ev_ebitda, *_BOUNDS["ev_ebitda"], invert=True),
-        "pe_ratio":          score(pe, *_BOUNDS["pe_ratio"], invert=True),
-        "pfcf":              score(pfcf, *_BOUNDS["pfcf"], invert=True),
-        "earnings_quality":  score(accruals, *_BOUNDS["earnings_quality"], invert=True),
-        "analyst_consensus": analyst_score,
+    return rescore_from_metrics(metrics, raw_metrics=metrics)
+
+
+def rescore_from_metrics(metrics: dict, raw_metrics: dict | None = None) -> dict:
+    """Re-score Valuation from persisted metric values."""
+    raw_metrics = dict(raw_metrics or metrics)
+    validated_metrics, flags = validate_pillar_metrics(metrics)
+    for key in (
+        "ev_ebitda",
+        "pe_ratio",
+        "pfcf",
+        "accruals_ratio",
+        "analyst_strong_buy",
+        "analyst_buy",
+        "analyst_hold",
+        "analyst_sell",
+        "analyst_strong_sell",
+    ):
+        validated_metrics.setdefault(key, None)
+    recs = {
+        "strong_buy": validated_metrics.get("analyst_strong_buy"),
+        "buy": validated_metrics.get("analyst_buy"),
+        "hold": validated_metrics.get("analyst_hold"),
+        "sell": validated_metrics.get("analyst_sell"),
+        "strong_sell": validated_metrics.get("analyst_strong_sell"),
     }
 
-    pillar = weighted_avg([(scores[k], _WEIGHTS[k]) for k in _WEIGHTS])
+    scores = {
+        "ev_ebitda":         score(validated_metrics.get("ev_ebitda"), *_BOUNDS["ev_ebitda"], invert=True),
+        "pe_ratio":          score(validated_metrics.get("pe_ratio"), *_BOUNDS["pe_ratio"], invert=True),
+        "pfcf":              score(validated_metrics.get("pfcf"), *_BOUNDS["pfcf"], invert=True),
+        "earnings_quality":  score(validated_metrics.get("accruals_ratio"), *_BOUNDS["earnings_quality"], invert=True),
+        "analyst_consensus": _score_recommendations(recs),
+    }
 
-    _log.info("    [VE] Final: ev/ebitda=%s pe=%s pfcf=%s accruals=%s analyst=%s -> pillar=%.1f",
-              metrics["ev_ebitda"], metrics["pe_ratio"], metrics["pfcf"],
-              metrics["accruals_ratio"],
-              scores.get("analyst_consensus"), pillar or 0)
+    raw_score, completeness_pct = weighted_avg([(scores[k], _WEIGHTS[k]) for k in _WEIGHTS])
+    pillar_score = apply_completeness_cap(raw_score, completeness_pct)
 
-    return {"pillar_score": pillar, "metrics": metrics, "scores": scores}
+    _log.info("    [VE] Final: ev/ebitda=%s pe=%s pfcf=%s accruals=%s analyst=%s -> raw=%.1f pillar=%.1f completeness=%.1f%%",
+              validated_metrics["ev_ebitda"], validated_metrics["pe_ratio"], validated_metrics["pfcf"],
+              validated_metrics["accruals_ratio"],
+              scores.get("analyst_consensus"), raw_score, pillar_score, completeness_pct)
+
+    return {
+        "pillar_score": pillar_score,
+        "raw_score": raw_score,
+        "completeness_pct": completeness_pct,
+        "raw_metrics": raw_metrics,
+        "metrics": validated_metrics,
+        "scores": scores,
+        "data_quality_flags": flags,
+        "cap_applied": pillar_score != raw_score,
+    }
 
 
 def _score_recommendations(recs: dict) -> float | None:
