@@ -120,6 +120,7 @@ class PolygonClient:
             "company_name": r.get("name"),
             "market_cap": r.get("market_cap"),
             "sector": r.get("sic_description"),
+            "primary_exchange": r.get("primary_exchange"),
             "description": r.get("description"),
             "homepage": r.get("homepage_url"),
             "employees": r.get("total_employees"),

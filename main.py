@@ -19,6 +19,7 @@ from api.routes_comps import router as comps_router
 from api.routes_dcf import router as dcf_router
 from api.routes_eva import router as eva_router
 from api.routes_analyses import router as analyses_router
+from api.routes_quote import router as quote_router
 
 # ── Logging setup (console + file) ──────────────────────────
 LOG_DIR = Path(__file__).resolve().parent / "logs"
@@ -99,19 +100,20 @@ async def lifespan(app: FastAPI):
         universe = (await session.execute(select(func.count()).select_from(UniverseSymbol))).scalar()
     _log.info("DB status: %d evaluations, %d history records, %d universe symbols", evals, history, universe)
     
-    # Start crawler scheduler if enabled
-    if settings.crawler_enabled:
-        from pipeline.scheduler import start_scheduler
-        start_scheduler(settings)
-        _log.info("Crawler scheduler started — schedule: %s", settings.crawler_schedule)
-    
-    # Auto-resume: only if previous status was "running" (interrupted)
-    await _auto_resume_crawler(settings)
+    # Start the market-hours scheduler and let it enforce startup state.
+    from pipeline.scheduler import start_scheduler
+    scheduler = start_scheduler(settings)
+    await scheduler.start()
+    app.state.crawler_scheduler = scheduler
     
     yield
     
     # ── Graceful shutdown ────────────────────────────────────
     _log.info("Shutting down Company Evaluator Service...")
+
+    scheduler = getattr(app.state, "crawler_scheduler", None)
+    if scheduler is not None:
+        await scheduler.stop()
     
     from pipeline.crawler import get_crawler
     crawler = get_crawler()
@@ -151,6 +153,7 @@ app.include_router(comps_router, prefix="/api", tags=["valuation"])
 app.include_router(dcf_router, prefix="/api", tags=["valuation"])
 app.include_router(eva_router, prefix="/api", tags=["valuation"])
 app.include_router(analyses_router, prefix="/api", tags=["analyses"])
+app.include_router(quote_router, prefix="/api", tags=["quote"])
 
 @app.get("/health")
 async def health():

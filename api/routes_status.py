@@ -8,6 +8,7 @@ from fastapi import APIRouter
 from sqlalchemy import select, func, desc
 
 from pipeline.crawler import get_crawler
+from pipeline.scheduler import get_scheduler
 from db.database import get_session, CompanyEvaluation, UniverseSymbol
 
 router = APIRouter()
@@ -46,7 +47,8 @@ async def dashboard():
 
     # ── Crawler info ─────────────────────────────────────────
     crawler = get_crawler()
-    crawler_status = crawler.status
+    scheduler = get_scheduler()
+    crawler_status = {**crawler.status, **scheduler.status}
 
     # ── Universe info ────────────────────────────────────────
     universe = {"total": 0, "active": 0, "by_tier": {}, "last_refresh": None}

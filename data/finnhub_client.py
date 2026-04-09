@@ -149,6 +149,17 @@ class FinnhubClient:
             "strong_sell": latest.get("strongSell", 0),
         }
 
+    async def get_quote(self, symbol: str) -> dict | None:
+        """Fetch current quote from Finnhub /quote endpoint.
+
+        Returns dict with keys: c (current), d (change), dp (change%),
+        h (high), l (low), o (open), pc (prev close), t (timestamp).
+        """
+        data = await self._request("/quote", {"symbol": symbol})
+        if not data or not data.get("c"):
+            return None
+        return data
+
     async def get_earnings_calendar(self, symbol: str) -> list[dict]:
         """Get upcoming and recent earnings dates for a symbol.
 

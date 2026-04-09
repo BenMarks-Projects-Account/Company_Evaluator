@@ -162,6 +162,7 @@ async def analyze_eva(symbol: str, *, skip_llm: bool = False) -> dict:
         "ok": True,
         "symbol": symbol,
         "current_price": round(current_price, 2) if current_price else None,
+        "grade": quality["grade"],
         "capital_structure": {
             "invested_capital": _fmt(roic_data["invested_capital"]),
             "total_debt": _fmt(roic_data["total_debt"]),
@@ -775,6 +776,7 @@ def _insufficient_data_result(symbol: str, current_price: float | None, reason: 
         "ok": True,
         "symbol": symbol,
         "current_price": round(current_price, 2) if current_price else None,
+        "grade": "INSUFFICIENT_DATA",
         "capital_structure": None,
         "roic_analysis": None,
         "wacc": None,

@@ -18,7 +18,7 @@ TIER_DEFINITIONS = {
         "label": "Large Cap",
         "market_cap_min": 10_000_000_000,   # $10B
         "market_cap_max": None,
-        "target_size": 150,
+        "target_size": 200,
         "min_volume": 50_000,
         "refresh_frequency": "monthly",
     },
@@ -26,7 +26,7 @@ TIER_DEFINITIONS = {
         "label": "Mid Cap",
         "market_cap_min": 2_000_000_000,    # $2B
         "market_cap_max": 10_000_000_000,   # $10B
-        "target_size": 150,
+        "target_size": 275,
         "min_volume": 50_000,
         "refresh_frequency": "monthly",
     },
@@ -34,7 +34,7 @@ TIER_DEFINITIONS = {
         "label": "Small Cap",
         "market_cap_min": 300_000_000,      # $300M
         "market_cap_max": 2_000_000_000,    # $2B
-        "target_size": 150,
+        "target_size": 275,
         "min_volume": 50_000,
         "refresh_frequency": "monthly",
     },
@@ -314,7 +314,7 @@ class UniverseBuilder:
             _log.info("All %d tickers have market_cap from Polygon — no enrichment needed", len(tickers))
             return tickers
 
-        MAX_ENRICH = 600
+        MAX_ENRICH = 1200
         to_enrich = missing[:MAX_ENRICH]
         _log.info(
             "Enriching %d/%d tickers missing market_cap via Finnhub...",

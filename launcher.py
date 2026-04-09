@@ -13,6 +13,7 @@ import urllib.request
 import urllib.error
 import atexit
 import json
+from datetime import datetime
 
 # ── Frozen-exe detection ─────────────────────────────────────
 IS_FROZEN = getattr(sys, "frozen", False)
@@ -34,7 +35,7 @@ LOG_FILE = LOG_DIR / "company_evaluator.log"
 LOCK_FILE = BASE_DIR / ".evaluator.lock"
 
 VENV_PYTHON = BASE_DIR / ".venv" / "Scripts" / "python.exe"
-SYSTEM_PYTHON = Path("C:/Python314/python.exe")
+SYSTEM_PYTHON = Path("C:/Users/benja/anaconda3/python.exe")
 
 if VENV_PYTHON.exists():
     PYTHON = str(VENV_PYTHON)
@@ -108,6 +109,17 @@ def _format_duration(seconds):
         return f"{minutes}m {seconds % 60}s"
     hours = minutes // 60
     return f"{hours}h {minutes % 60}m"
+
+
+def _format_et_timestamp(value):
+    """Format an ISO timestamp into a compact ET label."""
+    if not value:
+        return "—"
+    try:
+        dt = datetime.fromisoformat(value)
+    except ValueError:
+        return str(value)
+    return dt.strftime("%a %I:%M %p ET")
 
 
 class LauncherApp(tk.Tk):
@@ -384,6 +396,8 @@ class LauncherApp(tk.Tk):
         self._crawl_current = self._make_kv_row(crawl_card, "Current", "—")
         self._crawl_speed = self._make_kv_row(crawl_card, "Speed", "—")
         self._crawl_eta = self._make_kv_row(crawl_card, "ETA", "—")
+        self._crawl_schedule = self._make_kv_row(crawl_card, "Schedule", "—")
+        self._crawl_next = self._make_kv_row(crawl_card, "Next", "—")
 
         # Progress bar
         prog_frame = tk.Frame(crawl_card, bg=self.PANEL_LITE)
@@ -574,6 +588,9 @@ class LauncherApp(tk.Tk):
         progress = cr.get("progress", {})
         current = cr.get("current_symbol")
         cycle = cr.get("cycle_number", 0)
+        mode = cr.get("mode", "auto")
+        schedule_state = cr.get("schedule_state", "market_closed")
+        next_transition = cr.get("next_transition")
 
         total = progress.get("total", 0)
         evaluated = progress.get("evaluated", 0)
@@ -595,9 +612,25 @@ class LauncherApp(tk.Tk):
             "running": "Running",
             "idle": "Idle",
         }
-        self._crawl_status_lbl.config(text=status_labels.get(cr_status, cr_status.title()), fg=color)
+        if mode == "manual":
+            status_suffix = " (manual override)"
+        else:
+            schedule_text = "market open" if schedule_state == "market_open" else "market closed"
+            status_suffix = f" (auto - {schedule_text})"
+        self._crawl_status_lbl.config(
+            text=f"{status_labels.get(cr_status, cr_status.title())}{status_suffix}",
+            fg=color,
+        )
         self._crawl_dot.itemconfig(self._crawl_dot_id, fill=color)
         self._crawl_cycle_lbl.config(text=f"Cycle {cycle}" if cycle else "")
+
+        schedule_display = "Market open" if schedule_state == "market_open" else "Market closed"
+        if mode == "manual":
+            schedule_display += " • manual override active"
+        else:
+            schedule_display += " • auto schedule active"
+        self._crawl_schedule.config(text=schedule_display)
+        self._crawl_next.config(text=_format_et_timestamp(next_transition))
 
         if running and current:
             cur_idx = progress.get("current_index", 0)

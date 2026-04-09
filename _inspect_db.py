@@ -1,7 +1,11 @@
 """Quick DB inspection script — delete after use."""
+import json
+import pathlib
 import sqlite3
+from config import get_settings
 
-conn = sqlite3.connect("db/company_eval.db")
+settings = get_settings()
+conn = sqlite3.connect(settings.database_path)
 
 print("=== TABLES ===")
 tables = [r[0] for r in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")]
@@ -33,8 +37,7 @@ if "evaluation_history" in tables:
         print(" ", row)
 
 print("\n=== CRAWLER STATE JSON ===")
-import json, pathlib
-sf = pathlib.Path("db/crawler_state.json")
+sf = pathlib.Path(settings.database_path).parent / "crawler_state.json"
 if sf.exists():
     state = json.loads(sf.read_text())
     for k, v in state.items():

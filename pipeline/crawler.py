@@ -11,15 +11,18 @@ from config import get_settings
 
 _log = logging.getLogger(__name__)
 
-STATE_FILE = Path(__file__).resolve().parent.parent / "db" / "crawler_state.json"
+
+def _get_state_file() -> Path:
+    return Path(get_settings().database_path).parent / "crawler_state.json"
 
 
 def _load_state() -> dict | None:
     """Load persistent crawler state from disk."""
-    if not STATE_FILE.exists():
+    state_file = _get_state_file()
+    if not state_file.exists():
         return None
     try:
-        return json.loads(STATE_FILE.read_text(encoding="utf-8"))
+        return json.loads(state_file.read_text(encoding="utf-8"))
     except (json.JSONDecodeError, OSError) as exc:
         _log.warning("Could not load crawler state: %s", exc)
         return None
@@ -27,9 +30,10 @@ def _load_state() -> dict | None:
 
 def _save_state(state: dict):
     """Persist crawler state to disk."""
-    STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
+    state_file = _get_state_file()
+    state_file.parent.mkdir(parents=True, exist_ok=True)
     state["updated_at"] = datetime.now(timezone.utc).isoformat()
-    STATE_FILE.write_text(json.dumps(state, indent=2), encoding="utf-8")
+    state_file.write_text(json.dumps(state, indent=2), encoding="utf-8")
 
 
 async def _get_ordered_symbols() -> list[str]:

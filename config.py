@@ -15,6 +15,29 @@ DB_DIR = os.path.join(_PROJECT_ROOT, "db")
 os.makedirs(DB_DIR, exist_ok=True)
 DB_PATH = os.path.join(DB_DIR, "company_eval.db")
 _DEFAULT_DB_URL = f"sqlite:///{DB_PATH}"
+_SQLITE_URL_PREFIX = "sqlite:///"
+
+
+def sqlite_url_to_path(database_url: str) -> str:
+    """Convert a SQLite URL into a filesystem path."""
+    if not database_url.startswith(_SQLITE_URL_PREFIX):
+        raise ValueError(f"Unsupported database URL: {database_url}")
+
+    if database_url.startswith("sqlite:////"):
+        unc_target = database_url[len("sqlite:////"):]
+        if unc_target and not os.path.splitdrive(unc_target)[0]:
+            return "\\\\" + unc_target.replace("/", "\\")
+
+    raw_path = database_url[len(_SQLITE_URL_PREFIX):]
+    return raw_path.replace("/", os.sep)
+
+
+def sqlite_path_to_url(database_path: str) -> str:
+    """Convert a filesystem path into a SQLite URL."""
+    normalized_path = os.path.normpath(database_path)
+    if normalized_path.startswith("\\\\"):
+        return "sqlite:////" + normalized_path.lstrip("\\").replace("\\", "/")
+    return f"{_SQLITE_URL_PREFIX}{normalized_path}"
 
 
 class Settings(BaseSettings):
@@ -54,13 +77,16 @@ class Settings(BaseSettings):
     def _resolve_db_path(self):
         """Resolve relative SQLite paths to absolute (safe under PyInstaller)."""
         url = self.database_url
-        prefix = "sqlite:///"
-        if url.startswith(prefix):
-            db_path = url[len(prefix):]
+        if url.startswith(_SQLITE_URL_PREFIX):
+            db_path = sqlite_url_to_path(url)
             if not os.path.isabs(db_path):
                 abs_path = os.path.join(_PROJECT_ROOT, db_path)
-                object.__setattr__(self, "database_url", f"{prefix}{abs_path}")
+                object.__setattr__(self, "database_url", sqlite_path_to_url(abs_path))
         return self
+
+    @property
+    def database_path(self) -> str:
+        return sqlite_url_to_path(self.database_url)
     
     class Config:
         env_file = ".env"

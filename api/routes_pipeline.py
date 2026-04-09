@@ -5,6 +5,7 @@ from fastapi import APIRouter, Query
 from pydantic import BaseModel
 from config import get_settings
 from pipeline.crawler import get_crawler
+from pipeline.scheduler import get_scheduler
 
 router = APIRouter()
 
@@ -18,7 +19,8 @@ class RunRequest(BaseModel):
 async def get_pipeline_status():
     """Get current crawler / pipeline status."""
     crawler = get_crawler()
-    return crawler.status
+    scheduler = get_scheduler()
+    return {**crawler.status, **scheduler.status}
 
 
 @router.post("/pipeline/run")
@@ -29,28 +31,40 @@ async def trigger_pipeline_run(req: RunRequest = RunRequest()):
     ordered list from the DB (oldest-evaluated first).
     """
     crawler = get_crawler()
+    scheduler = get_scheduler()
 
     if crawler._running:
-        return {"status": "already_running", **crawler.status}
+        scheduler.set_manual_override(started=True)
+        return {"status": "already_running", "mode": "manual", **crawler.status, **scheduler.status}
 
     symbols = req.symbols  # explicit list overrides auto-ordering
     if not symbols and not req.full_universe:
         return {"error": "Provide symbols list or set full_universe=true"}
 
+    scheduler.set_manual_override(started=True)
+
     # Run in background — return immediately
     # If symbols is None, crawler will query DB for oldest-first ordering
     asyncio.create_task(crawler.run(symbols if symbols else None))
-    return {"status": "started", "mode": "explicit" if symbols else "auto_ordered"}
+    return {
+        "status": "started",
+        "mode": "manual",
+        "request_mode": "explicit" if symbols else "auto_ordered",
+        **scheduler.status,
+    }
 
 
 @router.post("/pipeline/stop")
 async def stop_pipeline():
     """Stop the running crawler after the current symbol finishes."""
     crawler = get_crawler()
+    scheduler = get_scheduler()
     if not crawler._running:
-        return {"status": "not_running"}
+        scheduler.set_manual_override(started=False)
+        return {"status": "not_running", "mode": "manual", **scheduler.status}
+    scheduler.set_manual_override(started=False)
     crawler.stop()
-    return {"status": "stop_requested"}
+    return {"status": "stop_requested", "mode": "manual", **scheduler.status}
 
 
 @router.post("/pipeline/pause")

@@ -1,10 +1,13 @@
 """SQLite database setup with SQLAlchemy async."""
 
 import logging
+import os
+from sqlalchemy.engine import URL
 from sqlalchemy.ext.asyncio import create_async_engine, AsyncSession, async_sessionmaker
 from sqlalchemy.orm import DeclarativeBase
 from sqlalchemy import Column, String, Float, Integer, DateTime, Text, JSON, Boolean, event, text
 from datetime import datetime, timezone
+from config import sqlite_url_to_path
 
 _log = logging.getLogger(__name__)
 
@@ -157,21 +160,28 @@ _engine = None
 _session_factory = None
 
 def _set_sqlite_pragma(dbapi_connection, connection_record):
-    """Enable WAL mode for concurrent read/write safety."""
+    """Set SQLite pragmas for safer concurrent access on the NAS share."""
     cursor = dbapi_connection.cursor()
     cursor.execute("PRAGMA journal_mode=WAL;")
+    cursor.execute("PRAGMA synchronous=NORMAL;")
+    cursor.execute("PRAGMA busy_timeout=10000;")
+    cursor.execute("PRAGMA cache_size=-64000;")
     cursor.close()
 
 async def init_db(database_url: str):
     global _engine, _session_factory
-    
-    # SQLite async requires aiosqlite and sqlite+aiosqlite:// prefix
+
     if database_url.startswith("sqlite:///"):
-        async_url = database_url.replace("sqlite:///", "sqlite+aiosqlite:///")
+        db_path = sqlite_url_to_path(database_url)
+        async_url = URL.create("sqlite+aiosqlite", database=db_path)
     else:
+        db_path = database_url
         async_url = database_url
-    
-    _engine = create_async_engine(async_url, echo=False)
+
+    if database_url.startswith("sqlite:///"):
+        os.makedirs(os.path.dirname(db_path), exist_ok=True)
+
+    _engine = create_async_engine(async_url, echo=False, connect_args={"timeout": 10})
     _session_factory = async_sessionmaker(_engine, class_=AsyncSession, expire_on_commit=False)
     
     # Enable WAL mode on every new connection
@@ -185,7 +195,6 @@ async def init_db(database_url: str):
     await _migrate_universe_symbols()
     
     # Log resolved DB path
-    db_path = async_url.replace("sqlite+aiosqlite:///", "")
     _log.info("Database initialized: %s (WAL mode enabled)", db_path)
 
 
