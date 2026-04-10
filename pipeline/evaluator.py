@@ -6,6 +6,8 @@ import time
 from datetime import datetime, timezone
 from data.company_data_service import CompanyDataService
 from metrics.composite import compute_composite_score, recompute_composite_from_metrics
+from metrics.breakout import compute_breakout_score
+from metrics.cross_validator import cross_validate_finnhub_metrics
 from analysis.company_analyst import analyze_company
 from db.database import get_session, CompanyEvaluation, EvaluationHistory
 from sqlalchemy import select
@@ -14,6 +16,7 @@ _log = logging.getLogger(__name__)
 SCORING_VERSION = "0.2.0"
 
 _data_service = None
+_fmp_client = None
 
 
 def _get_data_service():
@@ -21,6 +24,26 @@ def _get_data_service():
     if _data_service is None:
         _data_service = CompanyDataService()
     return _data_service
+
+
+def _get_fmp_client():
+    """Lazily create FMP client if enabled and configured."""
+    global _fmp_client
+    if _fmp_client is not None:
+        return _fmp_client
+
+    from config import get_settings
+    settings = get_settings()
+    if not settings.fmp_enabled or not settings.fmp_api_key:
+        return None
+
+    from data.fmp_client import FMPClient
+    _fmp_client = FMPClient(
+        api_key=settings.fmp_api_key,
+        base_url=settings.fmp_base_url,
+        rate_limit_per_min=settings.fmp_rate_limit_per_min,
+    )
+    return _fmp_client
 
 
 async def evaluate_company(symbol: str, force: bool = False) -> dict:
@@ -45,7 +68,7 @@ async def evaluate_company(symbol: str, force: bool = False) -> dict:
 
     # Log what data we got
     for key in ["financials_quarterly", "financials_annual", "basic_financials",
-                "price_history", "eps_estimates", "price_target",
+                "price_history",
                 "insider_transactions", "analyst_recommendations"]:
         blob = company_data.get(key)
         if blob is None:
@@ -66,6 +89,30 @@ async def evaluate_company(symbol: str, force: bool = False) -> dict:
     if company_data.get("data_quality") == "degraded":
         _log.error("[%s] ABORTED: Data quality is 'degraded' — insufficient data to score", symbol)
         return {"symbol": symbol, "status": "degraded", "errors": company_data.get("errors", [])}
+
+    # Step 1b: FMP cross-validation (optional — adjusts Finnhub metrics before scoring)
+    cross_validation_flags = []
+    fmp_client = _get_fmp_client()
+    if fmp_client:
+        _log.info("[%s] Step 1b: FMP cross-validation...", symbol)
+        try:
+            fmp_data = await fmp_client.get_all_cross_validation_data(symbol)
+            bf = company_data.get("basic_financials")
+            if bf and isinstance(bf, dict) and "metrics" in bf:
+                _, cross_validation_flags = cross_validate_finnhub_metrics(
+                    bf["metrics"], fmp_data
+                )
+                if cross_validation_flags:
+                    _log.info("[%s] Step 1b: %d metric(s) adjusted by FMP cross-validation",
+                              symbol, len(cross_validation_flags))
+                else:
+                    _log.info("[%s] Step 1b: FMP cross-validation — all metrics within tolerance",
+                              symbol)
+            else:
+                _log.info("[%s] Step 1b: No Finnhub metrics to cross-validate", symbol)
+        except Exception as exc:
+            _log.warning("[%s] Step 1b: FMP cross-validation failed (non-blocking) — %s",
+                         symbol, exc)
 
     # Step 2: Compute metrics + scores
     _log.info("[%s] Step 2/5: Computing 5-pillar metrics...", symbol)
@@ -93,6 +140,17 @@ async def evaluate_company(symbol: str, force: bool = False) -> dict:
             parts = [f"{k}={v}(s:{sub_scores.get(k)})" for k, v in metrics.items()]
             _log.info("[%s]   %s details: %s", symbol, pname, ", ".join(parts))
 
+    # Step 2b: Compute breakout potential score (parallel to composite)
+    breakout_result = compute_breakout_score(company_data)
+    if breakout_result.get("filtered_out"):
+        _log.info("[%s] Breakout: FILTERED — %s", symbol, breakout_result.get("filter_reason"))
+    else:
+        _log.info("[%s] Breakout: score=%.1f (completeness=%.0f%%)",
+                  symbol, breakout_result.get("score") or 0,
+                  breakout_result.get("completeness_pct") or 0)
+        for comp_name, comp_data in breakout_result.get("components", {}).items():
+            _log.info("[%s]   breakout.%s = %s", symbol, comp_name, comp_data.get("score"))
+
     # Step 3: LLM analysis (graceful — failure doesn't block pipeline)
     _log.info("[%s] Step 3/5: Running LLM analysis...", symbol)
     t3 = time.time()
@@ -114,7 +172,7 @@ async def evaluate_company(symbol: str, force: bool = False) -> dict:
     _log.info("[%s] Step 4/5: Saving to database...", symbol)
     t4 = time.time()
     raw_financials_snapshot = _build_raw_financials_snapshot(company_data, scores)
-    structured_errors = _build_errors_snapshot(company_data, scores)
+    structured_errors = _build_errors_snapshot(company_data, scores, cross_validation_flags)
     async with get_session() as session:
         # Upsert — update existing or insert new
         existing = await session.execute(
@@ -162,6 +220,10 @@ async def evaluate_company(symbol: str, force: bool = False) -> dict:
         eval_record.raw_financials = raw_financials_snapshot
         eval_record.errors = structured_errors
 
+        # Breakout Potential Score (parallel to composite)
+        eval_record.breakout_score = breakout_result.get("score")
+        eval_record.breakout_components = json.dumps(breakout_result)
+
         # Also write to history
         history = EvaluationHistory(
             symbol=symbol,
@@ -170,6 +232,7 @@ async def evaluate_company(symbol: str, force: bool = False) -> dict:
             snapshot={
                 "pillar_scores": ps,
                 "market_cap": profile.get("market_cap"),
+                "breakout_score": breakout_result.get("score"),
             },
         )
         session.add(history)
@@ -195,6 +258,9 @@ async def evaluate_company(symbol: str, force: bool = False) -> dict:
         "status": "complete",
         "composite_score": scores.get("composite_score"),
         "pillar_scores": scores.get("pillar_scores"),
+        "breakout_score": breakout_result.get("score"),
+        "breakout_filtered_out": breakout_result.get("filtered_out"),
+        "breakout_filter_reason": breakout_result.get("filter_reason"),
         "company_name": profile.get("company_name"),
         "sector": profile.get("sector"),
         "data_quality": company_data.get("data_quality"),
@@ -230,10 +296,8 @@ def _build_raw_financials_snapshot(company_data: dict, scores: dict) -> dict:
         "financials_annual": company_data.get("financials_annual"),
         "basic_financials": company_data.get("basic_financials"),
         "price_history": company_data.get("price_history"),
-        "eps_estimates": company_data.get("eps_estimates"),
-        "price_target": company_data.get("price_target"),
         "insider_transactions": company_data.get("insider_transactions"),
-        "peers": company_data.get("peers"),
+        "smart_money": company_data.get("smart_money"),
         "analyst_recommendations": company_data.get("analyst_recommendations"),
         "sources_used": company_data.get("sources_used"),
         "data_quality": company_data.get("data_quality"),
@@ -253,7 +317,8 @@ def _build_raw_financials_snapshot(company_data: dict, scores: dict) -> dict:
     }
 
 
-def _build_errors_snapshot(company_data: dict, scores: dict) -> dict:
+def _build_errors_snapshot(company_data: dict, scores: dict,
+                           cross_validation_flags: list[dict] | None = None) -> dict:
     fetch_errors = company_data.get("fetch_errors") or []
     data_quality_flags = [
         {**flag, "action": "rejected_treated_as_missing"}
@@ -273,6 +338,7 @@ def _build_errors_snapshot(company_data: dict, scores: dict) -> dict:
         "data_quality_flags": data_quality_flags,
         "missing_data_warnings": missing_data_warnings,
         "computational_errors": [],
+        "cross_validation_flags": cross_validation_flags or [],
     }
 
     if not any(payload.values()):

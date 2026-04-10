@@ -62,7 +62,13 @@ class Settings(BaseSettings):
     finnhub_rate_limit: float = 30.0  # Finnhub free tier: 30 req/sec
     yahoo_rate_limit: float = 1.0     # Yahoo: very conservative
     yahoo_enabled: bool = True        # Fallback — can disable entirely
-    
+
+    # FMP (Financial Modeling Prep) — cross-validator + Polygon fallback
+    fmp_api_key: str = ""
+    fmp_enabled: bool = False         # Enable FMP (cross-validation + statement fallback)
+    fmp_rate_limit_per_min: int = 300 # Paid tier: 300 req/min
+    fmp_base_url: str = "https://financialmodelingprep.com/stable"
+
     # Pipeline
     universe: str = "sp500_top100"
     crawler_enabled: bool = False

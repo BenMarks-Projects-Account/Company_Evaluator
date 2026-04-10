@@ -20,6 +20,7 @@ from api.routes_dcf import router as dcf_router
 from api.routes_eva import router as eva_router
 from api.routes_analyses import router as analyses_router
 from api.routes_quote import router as quote_router
+from api.routes_transcripts import router as transcripts_router
 
 # ── Logging setup (console + file) ──────────────────────────
 LOG_DIR = Path(__file__).resolve().parent / "logs"
@@ -154,6 +155,7 @@ app.include_router(dcf_router, prefix="/api", tags=["valuation"])
 app.include_router(eva_router, prefix="/api", tags=["valuation"])
 app.include_router(analyses_router, prefix="/api", tags=["analyses"])
 app.include_router(quote_router, prefix="/api", tags=["quote"])
+app.include_router(transcripts_router, prefix="/api", tags=["transcripts"])
 
 @app.get("/health")
 async def health():

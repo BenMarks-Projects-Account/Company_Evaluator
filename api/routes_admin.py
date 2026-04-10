@@ -345,3 +345,25 @@ async def get_universe_stats():
     builder = UniverseBuilder()
     stats = await builder.get_stats()
     return stats
+
+
+@router.get("/admin/fmp-status")
+async def fmp_status():
+    """Check FMP cross-validator status: enabled, calls used/remaining today."""
+    settings = get_settings()
+    if not settings.fmp_enabled:
+        return {"enabled": False, "reason": "FMP_ENABLED=false in config"}
+
+    if not settings.fmp_api_key:
+        return {"enabled": False, "reason": "FMP_API_KEY not set"}
+
+    from pipeline.evaluator import _get_fmp_client
+    client = _get_fmp_client()
+    if client is None:
+        return {"enabled": False, "reason": "FMP client failed to initialize"}
+
+    return {
+        "enabled": True,
+        "rate_limit_per_min": settings.fmp_rate_limit_per_min,
+        "calls_today": client.calls_today,
+    }

@@ -25,18 +25,27 @@ async def get_ranked_companies(
     limit: int = Query(50, ge=1, le=500),
     sector: str = Query(None),
     min_score: float = Query(None),
+    min_breakout_score: float = Query(None, description="Minimum breakout potential score"),
+    sort: str = Query("composite", description="Sort by: composite or breakout"),
 ):
     """Get companies ranked by composite score (highest first)."""
     settings = get_settings()
     refresh_days = settings.refresh_period_days
 
     async with get_session() as session:
-        query = select(CompanyEvaluation).order_by(desc(CompanyEvaluation.composite_score))
+        if sort == "breakout":
+            query = select(CompanyEvaluation).where(
+                CompanyEvaluation.breakout_score.isnot(None)
+            ).order_by(desc(CompanyEvaluation.breakout_score))
+        else:
+            query = select(CompanyEvaluation).order_by(desc(CompanyEvaluation.composite_score))
         
         if sector:
             query = query.where(CompanyEvaluation.sector == sector)
         if min_score:
             query = query.where(CompanyEvaluation.composite_score >= min_score)
+        if min_breakout_score is not None:
+            query = query.where(CompanyEvaluation.breakout_score >= min_breakout_score)
         
         query = query.limit(limit)
         result = await session.execute(query)
@@ -54,6 +63,7 @@ async def get_ranked_companies(
                     "industry": company.industry,
                     "market_cap": company.market_cap,
                     "composite_score": company.composite_score,
+                    "breakout_score": company.breakout_score,
                     "pillar_scores": {
                         "business_quality": company.pillar_1_business_quality,
                         "operational_health": company.pillar_2_operational_health,
@@ -194,6 +204,10 @@ async def get_company_raw_data(symbol: str):
             "rating": company.llm_recommendation,
             "overall_completeness_pct": completeness_pct,
         },
+        "breakout": {
+            "score": company.breakout_score,
+            "components": _parse_json_field(company.breakout_components),
+        },
         "data_sources": _format_data_sources(raw, errors),
         "profile": _format_profile(company, raw),
         "raw_financials": _format_raw_financials(raw),
@@ -256,6 +270,10 @@ async def get_company_detail(symbol: str):
                 "capital_allocation": company.pillar_3_detail,
                 "growth_quality": company.pillar_4_detail,
                 "valuation": company.pillar_5_detail,
+            },
+            "breakout": {
+                "score": company.breakout_score,
+                "components": _parse_json_field(company.breakout_components),
             },
             "llm_analysis": {
                 "recommendation": company.llm_recommendation,
@@ -441,6 +459,7 @@ def _format_raw_financials(raw):
         "finnhub_metrics": (company_data.get("basic_financials") or {}).get("metrics"),
         "analyst_recommendations": company_data.get("analyst_recommendations"),
         "insider_transactions": company_data.get("insider_transactions"),
+        "smart_money": company_data.get("smart_money"),
     }
 
 

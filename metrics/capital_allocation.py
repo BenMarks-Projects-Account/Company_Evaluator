@@ -49,6 +49,7 @@ def compute(data: dict) -> dict:
     quarterly = get_statements(data, "quarterly")
     fh = get_finnhub_metrics(data)
     insiders = data.get("insider_transactions") or {}
+    smart_money = data.get("smart_money") or {}
 
     # --- ROIC-WACC Spread ---
     # Re-compute ROIC from statements
@@ -105,7 +106,14 @@ def compute(data: dict) -> dict:
     div_score = _score_payout(payout)
 
     # --- Insider Activity ---
-    insider_score = _score_insiders(insiders)
+    # Prefer FMP smart money score (richer data), fall back to Finnhub signal
+    insider_activity = smart_money.get("insider_activity") or {}
+    if insider_activity.get("score") is not None:
+        insider_score = insider_activity["score"]
+        insider_metric_value = insider_activity["signal"]
+    else:
+        insider_score = _score_insiders(insiders)
+        insider_metric_value = insiders.get("net_activity", "unknown")
 
     # --- R&D Intensity ---
     rd_ttm = ttm_sum(quarterly, "research_and_development")
@@ -118,7 +126,8 @@ def compute(data: dict) -> dict:
         "share_trend":      _r(share_trend),
         "payout_ratio":     _r(payout / 100 if payout is not None else None),
         "rd_intensity":     _r(rd_intensity),
-        "insider_net":      insiders.get("net_activity", "unknown"),
+        "insider_net":      insider_metric_value,
+        "insider_score":    _r(insider_score),
         "wacc_est":         _r(wacc_est),
         "roic":             _r(roic),
     }
@@ -130,16 +139,22 @@ def rescore_from_metrics(metrics: dict, raw_metrics: dict | None = None) -> dict
     """Re-score Capital Allocation from persisted metric values."""
     raw_metrics = dict(raw_metrics or metrics)
     validated_metrics, flags = validate_pillar_metrics(metrics)
-    for key in ("roic_wacc_spread", "share_trend", "payout_ratio", "rd_intensity", "insider_net", "wacc_est", "roic"):
+    for key in ("roic_wacc_spread", "share_trend", "payout_ratio", "rd_intensity", "insider_net", "insider_score", "wacc_est", "roic"):
         validated_metrics.setdefault(key, None)
     payout_ratio = validated_metrics.get("payout_ratio")
     payout_pct = payout_ratio * 100 if payout_ratio is not None else None
+
+    # Use pre-computed insider_score if available (from FMP smart money),
+    # otherwise fall back to legacy signal-based scoring.
+    insider_sub = validated_metrics.get("insider_score")
+    if insider_sub is None:
+        insider_sub = _score_insiders({"net_activity": validated_metrics.get("insider_net", "unknown")})
 
     scores = {
         "roic_wacc_spread": score(validated_metrics.get("roic_wacc_spread"), -0.02, 0.20),
         "share_trend":      score(validated_metrics.get("share_trend"), -0.05, 0.05, invert=True),
         "dividend_sustain": _score_payout(payout_pct),
-        "insider_activity": _score_insiders({"net_activity": validated_metrics.get("insider_net", "unknown")}),
+        "insider_activity": insider_sub,
         "rd_intensity":     score(validated_metrics.get("rd_intensity"), 0.0, 0.15),
     }
 

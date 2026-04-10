@@ -50,6 +50,10 @@ class CompanyEvaluation(Base):
     llm_risks = Column(JSON)
     llm_catalysts = Column(JSON)
     
+    # Breakout Potential Score (parallel to composite)
+    breakout_score = Column(Float)
+    breakout_components = Column(JSON)
+
     # Raw data snapshot (JSON — for auditing)
     raw_financials = Column(JSON)
     
@@ -194,6 +198,9 @@ async def init_db(database_url: str):
     # Migrate: add missing columns to universe_symbols (preserves existing data)
     await _migrate_universe_symbols()
     
+    # Migrate: add breakout columns to company_evaluations
+    await _migrate_company_evaluations()
+    
     # Log resolved DB path
     _log.info("Database initialized: %s (WAL mode enabled)", db_path)
 
@@ -226,6 +233,25 @@ async def _migrate_universe_symbols():
                     f"ALTER TABLE universe_symbols ADD COLUMN {col_name} {col_type}"
                 ))
                 _log.info("Migrated universe_symbols: added column %s (%s)", col_name, col_type)
+
+
+async def _migrate_company_evaluations():
+    """Add breakout columns to company_evaluations if they don't exist yet."""
+    _new_columns = {
+        "breakout_score": "REAL",
+        "breakout_components": "TEXT",
+    }
+    async with _engine.begin() as conn:
+        result = await conn.execute(text("PRAGMA table_info(company_evaluations)"))
+        existing = {row[1] for row in result}
+
+        for col_name, col_type in _new_columns.items():
+            if col_name not in existing:
+                await conn.execute(text(
+                    f"ALTER TABLE company_evaluations ADD COLUMN {col_name} {col_type}"
+                ))
+                _log.info("Migrated company_evaluations: added column %s (%s)", col_name, col_type)
+
 
 async def close_db():
     """Dispose engine cleanly — call on shutdown."""
