@@ -210,7 +210,53 @@ class FMPClient:
 
     # ── HTTP layer ───────────────────────────────────────────
 
-    async def _request(self, path: str, params: dict | None = None) -> list | dict | None:
+    async def stock_screener(
+        self,
+        *,
+        market_cap_min: float | None = None,
+        market_cap_max: float | None = None,
+        price_min: float | None = None,
+        volume_min: float | None = None,
+        sector: str | None = None,
+        country: str = "US",
+        exchange: str = "nyse,nasdaq",
+        is_actively_trading: bool = True,
+        is_etf: bool = False,
+        is_fund: bool = False,
+        limit: int = 1000,
+    ) -> list[dict] | None:
+        """FMP stock screener — returns companies matching criteria."""
+        params: dict = {}
+        if market_cap_min is not None:
+            params["marketCapMoreThan"] = int(market_cap_min)
+        if market_cap_max is not None:
+            params["marketCapLowerThan"] = int(market_cap_max)
+        if price_min is not None:
+            params["priceMoreThan"] = price_min
+        if volume_min is not None:
+            params["volumeMoreThan"] = int(volume_min)
+        if sector:
+            params["sector"] = sector
+        if country:
+            params["country"] = country
+        if exchange:
+            params["exchange"] = exchange
+        if is_actively_trading:
+            params["isActivelyTrading"] = "true"
+        if not is_etf:
+            params["isEtf"] = "false"
+        if not is_fund:
+            params["isFund"] = "false"
+        params["limit"] = limit
+
+        result = await self._request("/stable/company-screener", params=params)
+        if isinstance(result, list):
+            return result
+        return None
+
+    # ── HTTP layer ───────────────────────────────────────────
+
+    async def _request(self, path: str, params: dict | None = None):
         """Make a rate-limited request to FMP API."""
         import asyncio
         self._maybe_reset_counter()
@@ -226,7 +272,11 @@ class FMPClient:
             await asyncio.sleep(self._min_interval - elapsed)
         self._last_request = time.monotonic()
 
-        url = f"{self._base_url}{path}"
+        # Route stable endpoints to the stable base URL, v3 endpoints to the configured base
+        if path.startswith("/stable/"):
+            url = f"https://financialmodelingprep.com{path}"
+        else:
+            url = f"{self._base_url}{path}"
         req_params = {"apikey": self._api_key}
         if params:
             req_params.update(params)

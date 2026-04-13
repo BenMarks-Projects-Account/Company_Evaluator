@@ -160,6 +160,22 @@ class FinnhubClient:
             return None
         return data
 
+    async def get_ipo_calendar(self, from_date: str, to_date: str) -> dict | None:
+        """Get IPO calendar from Finnhub.
+
+        Args:
+            from_date: Start date (YYYY-MM-DD)
+            to_date: End date (YYYY-MM-DD)
+
+        Returns dict with 'ipoCalendar' list, each entry having
+        symbol, name, date, exchange, price, numberOfShares, status, etc.
+        """
+        data = await self._request(
+            "/calendar/ipo",
+            {"from": from_date, "to": to_date},
+        )
+        return data if isinstance(data, dict) else None
+
     async def get_earnings_calendar(self, symbol: str) -> list[dict]:
         """Get upcoming and recent earnings dates for a symbol.
 

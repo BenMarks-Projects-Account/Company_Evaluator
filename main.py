@@ -21,10 +21,18 @@ from api.routes_eva import router as eva_router
 from api.routes_analyses import router as analyses_router
 from api.routes_quote import router as quote_router
 from api.routes_transcripts import router as transcripts_router
+from api.routes_on_demand import router as on_demand_router
+from api.routes_charts import router as charts_router
 
 # ── Logging setup (console + file) ──────────────────────────
-LOG_DIR = Path(__file__).resolve().parent / "logs"
-LOG_DIR.mkdir(exist_ok=True)
+# Logs go to %LOCALAPPDATA%\CompanyEvaluator\logs to avoid OneDrive
+# file-locking that breaks RotatingFileHandler rotation.
+LOG_DIR = Path(
+    os.environ.get("LOCALAPPDATA", os.path.expanduser("~/AppData/Local")),
+    "CompanyEvaluator",
+    "logs",
+)
+LOG_DIR.mkdir(parents=True, exist_ok=True)
 LOG_FILE = LOG_DIR / "company_evaluator.log"
 
 _fmt = logging.Formatter("%(asctime)s [%(levelname)s] %(name)s: %(message)s")
@@ -33,7 +41,7 @@ _console = logging.StreamHandler()
 _console.setFormatter(_fmt)
 
 _file = logging.handlers.RotatingFileHandler(
-    LOG_FILE, maxBytes=5_000_000, backupCount=3, encoding="utf-8",
+    LOG_FILE, maxBytes=50_000_000, backupCount=5, encoding="utf-8",
 )
 _file.setFormatter(_fmt)
 
@@ -156,6 +164,8 @@ app.include_router(eva_router, prefix="/api", tags=["valuation"])
 app.include_router(analyses_router, prefix="/api", tags=["analyses"])
 app.include_router(quote_router, prefix="/api", tags=["quote"])
 app.include_router(transcripts_router, prefix="/api", tags=["transcripts"])
+app.include_router(on_demand_router, prefix="/api", tags=["on-demand"])
+app.include_router(charts_router, prefix="/api", tags=["charts"])
 
 @app.get("/health")
 async def health():

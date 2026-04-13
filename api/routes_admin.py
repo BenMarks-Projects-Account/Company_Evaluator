@@ -367,3 +367,56 @@ async def fmp_status():
         "rate_limit_per_min": settings.fmp_rate_limit_per_min,
         "calls_today": client.calls_today,
     }
+
+
+# ── Universe expansion (Phase 2) ────────────────────────────
+
+_expand_task: asyncio.Task | None = None
+
+
+@router.post("/admin/expand-universe")
+async def expand_universe_endpoint(dry_run: bool = True):
+    """Run the Phase 2 universe expansion pipeline.
+
+    Default is dry_run=true — shows what WOULD be added.
+    Pass ?dry_run=false to actually insert new symbols.
+    """
+    global _expand_task
+    from data.universe_expansion import expand_universe
+
+    # For dry_run, run inline (fast enough)
+    if dry_run:
+        return await expand_universe(dry_run=True)
+
+    # For real run, launch as background task
+    if _expand_task and not _expand_task.done():
+        return {"ok": False, "error": "A universe expansion is already running"}
+
+    async def _run():
+        try:
+            result = await expand_universe(dry_run=False)
+            _log.info("Universe expansion completed: %s", result)
+        except Exception as exc:
+            _log.error("Universe expansion failed: %s", exc, exc_info=True)
+
+    _expand_task = asyncio.create_task(_run())
+    return {"ok": True, "status": "started", "message": "Expansion running in background — check /admin/expand-universe/status"}
+
+
+@router.get("/admin/expand-universe/status")
+async def expand_universe_status():
+    """Check if a universe expansion task is currently running."""
+    if _expand_task is None:
+        return {"running": False, "status": "never_started"}
+    if _expand_task.done():
+        exc = _expand_task.exception() if not _expand_task.cancelled() else None
+        return {"running": False, "status": "error" if exc else "completed",
+                "error": str(exc) if exc else None}
+    return {"running": True, "status": "in_progress"}
+
+
+@router.get("/admin/universe/stats")
+async def get_expanded_universe_stats():
+    """Get universe statistics by tier, source, and sector (Phase 2 view)."""
+    from data.universe_expansion import get_universe_stats
+    return await get_universe_stats()

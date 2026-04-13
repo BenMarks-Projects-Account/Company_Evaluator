@@ -159,6 +159,32 @@ class UniverseSymbol(Base):
     priority = Column(Integer, default=0)  # higher = evaluate sooner
     notes = Column(Text)
 
+    # Phase 2 universe expansion
+    tier = Column(String(30))             # tier_0_watchlist, tier_1_large_mid, etc.
+    refresh_days = Column(Integer)        # target refresh frequency in days
+    discovery_source = Column(String(100)) # how the symbol was discovered
+    discovery_metadata = Column(Text)      # JSON — extra context from discovery
+
+
+class OnDemandJob(Base):
+    """Tracks on-demand analysis jobs submitted via the UI."""
+    __tablename__ = "on_demand_jobs"
+
+    job_id = Column(String(80), primary_key=True)
+    symbol = Column(String(10), nullable=False, index=True)
+    status = Column(String(20), nullable=False)  # queued, running, complete, failed, cancelled
+    created_at = Column(String(50), nullable=False)
+    started_at = Column(String(50))
+    completed_at = Column(String(50))
+    current_step = Column(String(200))
+    current_step_index = Column(Integer, default=0)
+    total_steps = Column(Integer, default=10)
+    percent = Column(Integer, default=0)
+    completed_steps = Column(Text, default="[]")  # JSON array
+    error = Column(Text)
+    result_json = Column(Text)  # JSON of full result payload
+
+
 # Engine and session
 _engine = None
 _session_factory = None
@@ -221,6 +247,10 @@ async def _migrate_universe_symbols():
         "last_screened_at": "TEXT",
         "delisted_at": "TEXT",
         "notes": "TEXT",
+        "tier": "TEXT",
+        "refresh_days": "INTEGER",
+        "discovery_source": "TEXT",
+        "discovery_metadata": "TEXT",
     }
     async with _engine.begin() as conn:
         # Get existing column names

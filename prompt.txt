@@ -1,298 +1,851 @@
-TASK: Build the Yahoo Finance data client that fetches all financial data needed for company evaluation. This client handles rate limiting, caching, and data normalization.
+# Company Evaluator: Phase 2 Universe Expansion
 
-CREATE: data/yahoo_client.py
+## Scope: Company Evaluator project ONLY
+## Service URL: http://192.168.1.143:8100
 
-The client must fetch for each company:
-1. Income statement (quarterly, last 12 quarters / 3 years)
-2. Balance sheet (quarterly, last 12 quarters)
-3. Cash flow statement (quarterly, last 12 quarters)
-4. Key statistics (market cap, PE, PEG, etc.)
-5. Price history (1 year daily)
-6. Insider transactions (6 months)
-7. Company profile (sector, industry, description)
-8. Earnings estimates (if available)
+## Background
+
+The data quality bulletproofing is complete. The breakout score
+is working. NAS storage is in place. Now we expand the universe
+from ~800 to ~2,500 symbols with a focus on finding small/mid
+cap companies that have the potential to become tomorrow's large
+caps.
+
+## Goal
+
+Build a universe expansion pipeline that:
+1. **Discovers** quality candidates using multi-criteria screening
+2. **Filters** out junk before evaluation cycles are wasted
+3. **Tags** companies with tier metadata for future use
+4. **Inserts** them into the existing universe table
+
+**This prompt does NOT modify the crawler.** The crawler will pick
+up new symbols using its existing staleness-based ordering. We'll
+add tier-priority logic to the crawler in a follow-up prompt only
+if needed after observing how the expansion plays out.
+
+The `tier` and `refresh_days` columns are added to the schema and
+populated for new symbols, but no code reads them yet. They're
+metadata for future use.
+
+## Strategic principles
+
+1. **Quality over quantity.** A 2,500-symbol universe of pre-screened
+   companies is better than a 5,000-symbol universe of everything.
+
+2. **The breakout score filters most stuff.** The hard filters
+   ($500M-$50B, $100M+ revenue, no funds/warrants) will reject ~50%
+   of any random sample. Pre-screening at ingestion saves crawler
+   cycles.
+
+3. **Tiered refresh rates.** Higher conviction = fresher data.
+   Lower conviction = less frequent updates. This is how we fit
+   2,500 symbols into the 7-day window.
+
+4. **Diverse discovery sources.** Multi-criteria screening + IPO
+   calendar + smart money signals = broader coverage than any
+   single source.
+
+5. **Idempotent ingestion.** Running the universe builder multiple
+   times should add new symbols without duplicating or breaking
+   existing entries.
+
+## Final decisions baked into this version
+
+These decisions were made before writing the prompt — do not
+relitigate them during implementation:
+
+- **Tier 2 floor: $500M.** More discovery surface area, accepting
+  more noise that the breakout score will filter.
+
+- **Tier 3 limited to ~200 highest-volume names.** Speculative
+  microcaps are kept lean for discovery value only. Volume floor
+  raised to 1M shares/day, price floor to $7.
+
+- **Sector screens kept.** They extend the cap range up to $20B
+  for Technology / Healthcare / Communication Services / Consumer
+  Cyclical, biasing the universe toward growth sectors.
+
+- **Target: ~2,500 symbols total** (current ~800 + ~1,700 new).
+
+## Step 1: Investigation
+
+### 1A. Find the existing universe builder
+
+```bash
+# Find the universe management code
+find app -name "universe*.py" -o -name "*universe*.py" | head -10
+grep -rn "universe_symbols\|add_to_universe\|universe_builder" app/services/ --include="*.py" | head -20
+```
+
+Report:
+- The current universe builder structure
+- The schema of the `universe_symbols` table
+- How symbols are added (batch insert? upsert?)
+- What metadata is tracked (tier, source, added_at, priority)
+- Whether there's an existing tier/priority system
+
+### 1B. Find FMP screener and IPO calendar capability
+
+```bash
+# FMP stock screener
+grep -n "stock.*screener\|stock_screener\|screener" app/services/data/fmp_client.py
+
+# Finnhub IPO calendar
+grep -n "ipo\|IPO" app/services/data/finnhub_client.py
+```
+
+Report whether these methods exist or need to be added.
+
+**Stop and report before proceeding to Step 2.**
+
+## Step 2: Schema migration
+
+The universe_symbols table needs new fields to support tiering:
+
+```sql
+-- Add new columns to universe_symbols
+ALTER TABLE universe_symbols ADD COLUMN tier TEXT DEFAULT 'tier_2';
+ALTER TABLE universe_symbols ADD COLUMN refresh_days INTEGER DEFAULT 7;
+ALTER TABLE universe_symbols ADD COLUMN discovery_source TEXT;
+ALTER TABLE universe_symbols ADD COLUMN discovery_metadata TEXT;  -- JSON
+ALTER TABLE universe_symbols ADD COLUMN added_at TEXT;
+ALTER TABLE universe_symbols ADD COLUMN last_screened_at TEXT;
+
+CREATE INDEX IF NOT EXISTS idx_universe_tier ON universe_symbols(tier);
+CREATE INDEX IF NOT EXISTS idx_universe_refresh ON universe_symbols(refresh_days);
+```
+
+If the table already has some of these columns, only add the
+missing ones. Use `ALTER TABLE ... ADD COLUMN IF NOT EXISTS` if
+SQLite supports it, otherwise check first.
+
+### Tier definitions
+
 ```python
-"""Yahoo Finance data client for company fundamental data."""
+TIER_DEFINITIONS = {
+    "tier_0_watchlist": {
+        "description": "Active watchlist — daily refresh",
+        "refresh_days": 1,
+        "priority": 100,
+    },
+    "tier_1_large_mid": {
+        "description": "Large/mid cap ($10B+) — 3-day refresh",
+        "refresh_days": 3,
+        "priority": 75,
+    },
+    "tier_2_breakout_zone": {
+        "description": "Breakout zone ($500M-$10B) — 7-day refresh",
+        "refresh_days": 7,
+        "priority": 50,
+    },
+    "tier_3_small_cap": {
+        "description": "Small cap speculative ($300M-$500M) — 14-day refresh",
+        "refresh_days": 14,
+        "priority": 25,
+    },
+    "tier_4_ipo_discovery": {
+        "description": "Recent IPOs (<2 years) — 7-day refresh",
+        "refresh_days": 7,
+        "priority": 60,
+    },
+}
+```
 
-import asyncio
+## Step 3: Add FMP screener method
+
+If not already present, add to `fmp_client.py`:
+
+```python
+async def stock_screener(
+    self,
+    market_cap_min: float | None = None,
+    market_cap_max: float | None = None,
+    price_min: float | None = None,
+    volume_min: float | None = None,
+    beta_min: float | None = None,
+    beta_max: float | None = None,
+    sector: str | None = None,
+    industry: str | None = None,
+    country: str = "US",
+    exchange: str = "nyse,nasdaq",
+    is_actively_trading: bool = True,
+    is_etf: bool = False,
+    is_fund: bool = False,
+    limit: int = 1000,
+) -> list[dict] | None:
+    """
+    FMP stock screener.
+    
+    Returns list of companies matching the criteria, with basic
+    fields like symbol, name, market cap, sector, industry, price.
+    """
+    params = {"apikey": self.api_key}
+    
+    if market_cap_min is not None:
+        params["marketCapMoreThan"] = market_cap_min
+    if market_cap_max is not None:
+        params["marketCapLowerThan"] = market_cap_max
+    if price_min is not None:
+        params["priceMoreThan"] = price_min
+    if volume_min is not None:
+        params["volumeMoreThan"] = volume_min
+    if beta_min is not None:
+        params["betaMoreThan"] = beta_min
+    if beta_max is not None:
+        params["betaLowerThan"] = beta_max
+    if sector:
+        params["sector"] = sector
+    if industry:
+        params["industry"] = industry
+    if country:
+        params["country"] = country
+    if exchange:
+        params["exchange"] = exchange
+    if is_actively_trading:
+        params["isActivelyTrading"] = "true"
+    if not is_etf:
+        params["isEtf"] = "false"
+    if not is_fund:
+        params["isFund"] = "false"
+    
+    params["limit"] = limit
+    
+    return await self._fetch(
+        "/company-screener",  # or whatever the actual stable path is
+        params=params,
+        return_list=True
+    )
+```
+
+**Investigation needed:** Verify the actual FMP screener path on
+the `/stable/` API. It might be `/company-screener`, `/stock-screener`,
+or something else. Test before committing to a path.
+
+## Step 4: Build the universe expansion service
+
+Create `app/services/universe_expansion.py`:
+
+```python
+"""
+Phase 2 universe expansion service.
+
+Discovers and onboards quality candidates for the company evaluator
+using multi-criteria screening, IPO calendar, and smart money signals.
+"""
+
 import logging
-import time
-from datetime import datetime, date, timedelta
-from typing import Optional
-import yfinance as yf
-import pandas as pd
+import json
+from datetime import datetime, timedelta
+from typing import Any
 
-_log = logging.getLogger(__name__)
+from app.services.data.fmp_client import fmp_client
+from app.services.data.finnhub_client import finnhub_client
+from app.db import get_db_connection
+
+logger = logging.getLogger(__name__)
 
 
-class YahooFinanceClient:
-    """Fetches fundamental data for company evaluation."""
+# Exclusion filters applied to all discovered symbols
+EXCLUSION_FILTERS = {
+    "name_contains": [
+        "acquisition corp",
+        "holdings",  # most holdcos are noise — careful, may be too aggressive
+        "blank check",
+        "spac",
+        "trust",
+        "preferred",
+        "warrant",
+    ],
+    "symbol_suffixes": ["W", "U", "R", ".W", ".U", ".R", "-W", "-U"],
+    "excluded_sectors": [
+        # Investment funds and REITs need separate evaluation models
+        # Decide whether to exclude or include with different tier
+    ],
+}
+
+
+async def expand_universe(dry_run: bool = True) -> dict:
+    """
+    Run the full universe expansion pipeline.
     
-    def __init__(self, rate_limit: float = 2.0):
-        self._min_interval = 1.0 / rate_limit
-        self._last_request = 0.0
-        self._cache = {}
-        self._cache_ttl = 3600  # 1 hour cache for financial data
+    Args:
+        dry_run: If True, report what would be added without inserting
     
-    async def get_company_data(self, symbol: str) -> dict:
-        """Fetch ALL data needed for company evaluation.
-        
-        Returns a comprehensive dict with all financial data,
-        or partial data with errors noted if some fetches fail.
-        """
-        _log.info("event=fetch_company_start symbol=%s", symbol)
-        start = time.time()
-        errors = []
-        
-        # Run synchronous yfinance calls in executor
-        loop = asyncio.get_event_loop()
-        
-        try:
-            ticker = await loop.run_in_executor(None, self._get_ticker, symbol)
-        except Exception as exc:
-            _log.error("event=ticker_failed symbol=%s error=%s", symbol, exc)
-            return {"symbol": symbol, "error": str(exc), "data": None}
-        
-        # Fetch each data type with individual error handling
-        profile = await loop.run_in_executor(None, self._fetch_profile, ticker, symbol)
-        income = await loop.run_in_executor(None, self._fetch_income_statement, ticker, symbol)
-        balance = await loop.run_in_executor(None, self._fetch_balance_sheet, ticker, symbol)
-        cashflow = await loop.run_in_executor(None, self._fetch_cash_flow, ticker, symbol)
-        stats = await loop.run_in_executor(None, self._fetch_key_stats, ticker, symbol)
-        prices = await loop.run_in_executor(None, self._fetch_price_history, ticker, symbol)
-        insiders = await loop.run_in_executor(None, self._fetch_insider_transactions, ticker, symbol)
-        
-        # Collect errors
-        for dataset_name, dataset in [("profile", profile), ("income", income), 
-                                        ("balance", balance), ("cashflow", cashflow),
-                                        ("stats", stats), ("prices", prices), ("insiders", insiders)]:
-            if dataset and dataset.get("error"):
-                errors.append(f"{dataset_name}: {dataset['error']}")
-        
-        elapsed = time.time() - start
-        _log.info("event=fetch_company_complete symbol=%s elapsed_s=%.1f errors=%d", symbol, elapsed, len(errors))
-        
-        return {
-            "symbol": symbol,
-            "fetched_at": datetime.now().isoformat(),
-            "fetch_duration_s": round(elapsed, 1),
-            "profile": profile,
-            "income_statement": income,
-            "balance_sheet": balance,
-            "cash_flow": cashflow,
-            "key_stats": stats,
-            "price_history": prices,
-            "insider_transactions": insiders,
-            "errors": errors,
-            "data_quality": "full" if len(errors) == 0 else "partial" if len(errors) < 4 else "degraded",
+    Returns:
+        {
+            "discovered": int,
+            "filtered_out": int,
+            "added": int,
+            "skipped_existing": int,
+            "tier_breakdown": {...},
+            "source_breakdown": {...},
         }
+    """
+    logger.info(f"Starting universe expansion (dry_run={dry_run})")
     
-    def _get_ticker(self, symbol: str) -> yf.Ticker:
-        self._rate_limit()
-        return yf.Ticker(symbol)
+    # Get current universe to avoid duplicates
+    existing = get_existing_symbols()
+    logger.info(f"Existing universe: {len(existing)} symbols")
     
-    def _fetch_profile(self, ticker, symbol) -> dict:
-        try:
-            self._rate_limit()
-            info = ticker.info or {}
-            return {
-                "company_name": info.get("longName") or info.get("shortName"),
-                "sector": info.get("sector"),
-                "industry": info.get("industry"),
-                "description": info.get("longBusinessSummary"),
-                "employees": info.get("fullTimeEmployees"),
-                "country": info.get("country"),
-                "website": info.get("website"),
-            }
-        except Exception as exc:
-            return {"error": str(exc)}
+    # Discover candidates from multiple sources in parallel
+    discovered = []
     
-    def _fetch_income_statement(self, ticker, symbol) -> dict:
-        try:
-            self._rate_limit()
-            quarterly = ticker.quarterly_income_stmt
-            annual = ticker.income_stmt
-            
-            return {
-                "quarterly": self._df_to_records(quarterly) if quarterly is not None else [],
-                "annual": self._df_to_records(annual) if annual is not None else [],
-            }
-        except Exception as exc:
-            return {"error": str(exc)}
+    # Source 1: FMP screener — Tier 2 Breakout Zone (the big one)
+    breakout_zone = await discover_breakout_zone()
+    discovered.extend(breakout_zone)
+    logger.info(f"Discovered {len(breakout_zone)} breakout zone candidates")
     
-    def _fetch_balance_sheet(self, ticker, symbol) -> dict:
-        try:
-            self._rate_limit()
-            quarterly = ticker.quarterly_balance_sheet
-            annual = ticker.balance_sheet
-            
-            return {
-                "quarterly": self._df_to_records(quarterly) if quarterly is not None else [],
-                "annual": self._df_to_records(annual) if annual is not None else [],
-            }
-        except Exception as exc:
-            return {"error": str(exc)}
+    # Source 2: FMP screener — Tier 3 Small Cap
+    small_caps = await discover_small_caps()
+    discovered.extend(small_caps)
+    logger.info(f"Discovered {len(small_caps)} small cap candidates")
     
-    def _fetch_cash_flow(self, ticker, symbol) -> dict:
-        try:
-            self._rate_limit()
-            quarterly = ticker.quarterly_cashflow
-            annual = ticker.cashflow
-            
-            return {
-                "quarterly": self._df_to_records(quarterly) if quarterly is not None else [],
-                "annual": self._df_to_records(annual) if annual is not None else [],
-            }
-        except Exception as exc:
-            return {"error": str(exc)}
+    # Source 3: FMP screener — Sector-focused (high-growth tech, biotech, etc.)
+    sector_focused = await discover_sector_focused()
+    discovered.extend(sector_focused)
+    logger.info(f"Discovered {len(sector_focused)} sector-focused candidates")
     
-    def _fetch_key_stats(self, ticker, symbol) -> dict:
-        try:
-            self._rate_limit()
-            info = ticker.info or {}
-            
-            return {
-                "market_cap": info.get("marketCap"),
-                "enterprise_value": info.get("enterpriseValue"),
-                "trailing_pe": info.get("trailingPE"),
-                "forward_pe": info.get("forwardPE"),
-                "peg_ratio": info.get("pegRatio"),
-                "price_to_book": info.get("priceToBook"),
-                "price_to_sales": info.get("priceToSalesTrailing12Months"),
-                "ev_to_ebitda": info.get("enterpriseToEbitda"),
-                "ev_to_revenue": info.get("enterpriseToRevenue"),
-                "profit_margin": info.get("profitMargins"),
-                "operating_margin": info.get("operatingMargins"),
-                "gross_margin": info.get("grossMargins"),
-                "return_on_equity": info.get("returnOnEquity"),
-                "return_on_assets": info.get("returnOnAssets"),
-                "revenue_growth": info.get("revenueGrowth"),
-                "earnings_growth": info.get("earningsGrowth"),
-                "dividend_yield": info.get("dividendYield"),
-                "payout_ratio": info.get("payoutRatio"),
-                "beta": info.get("beta"),
-                "short_percent_of_float": info.get("shortPercentOfFloat"),
-                "insider_percent_held": info.get("heldPercentInsiders"),
-                "institutional_percent_held": info.get("heldPercentInstitutions"),
-                "shares_outstanding": info.get("sharesOutstanding"),
-                "float_shares": info.get("floatShares"),
-                "book_value": info.get("bookValue"),
-                "current_price": info.get("currentPrice") or info.get("regularMarketPrice"),
-                "target_mean_price": info.get("targetMeanPrice"),
-                "recommendation_mean": info.get("recommendationMean"),
-            }
-        except Exception as exc:
-            return {"error": str(exc)}
+    # Source 4: Finnhub IPO calendar — recent IPOs
+    recent_ipos = await discover_recent_ipos()
+    discovered.extend(recent_ipos)
+    logger.info(f"Discovered {len(recent_ipos)} recent IPO candidates")
     
-    def _fetch_price_history(self, ticker, symbol) -> dict:
-        try:
-            self._rate_limit()
-            hist = ticker.history(period="1y")
-            
-            if hist.empty:
-                return {"error": "No price history available"}
-            
-            return {
-                "start_date": hist.index[0].strftime("%Y-%m-%d"),
-                "end_date": hist.index[-1].strftime("%Y-%m-%d"),
-                "data_points": len(hist),
-                "current_price": float(hist["Close"].iloc[-1]),
-                "year_high": float(hist["High"].max()),
-                "year_low": float(hist["Low"].min()),
-                "year_return": float((hist["Close"].iloc[-1] / hist["Close"].iloc[0]) - 1),
-                "avg_volume": int(hist["Volume"].mean()),
-                "volatility_annualized": float(hist["Close"].pct_change().std() * (252 ** 0.5)),
-                "max_drawdown": float(self._compute_max_drawdown(hist["Close"])),
-            }
-        except Exception as exc:
-            return {"error": str(exc)}
+    # Deduplicate (same symbol may come from multiple sources)
+    seen = set()
+    unique_candidates = []
+    for c in discovered:
+        symbol = c.get("symbol")
+        if symbol and symbol not in seen:
+            seen.add(symbol)
+            unique_candidates.append(c)
     
-    def _fetch_insider_transactions(self, ticker, symbol) -> dict:
-        try:
-            self._rate_limit()
-            insiders = ticker.insider_transactions
-            
-            if insiders is None or insiders.empty:
-                return {"transactions": [], "net_activity": "unknown"}
-            
-            # Summarize last 6 months
-            recent = insiders.head(20)  # Most recent 20 transactions
-            
-            buys = len(recent[recent["Text"].str.contains("Purchase|Buy", case=False, na=False)]) if "Text" in recent.columns else 0
-            sells = len(recent[recent["Text"].str.contains("Sale|Sell", case=False, na=False)]) if "Text" in recent.columns else 0
-            
-            if buys > sells + 2:
-                net_activity = "net_buying"
-            elif sells > buys + 2:
-                net_activity = "net_selling"
-            else:
-                net_activity = "neutral"
-            
-            return {
-                "transaction_count": len(recent),
-                "buys": buys,
-                "sells": sells,
-                "net_activity": net_activity,
-            }
-        except Exception as exc:
-            return {"error": str(exc)}
+    logger.info(f"Total unique candidates: {len(unique_candidates)}")
     
-    def _rate_limit(self):
-        now = time.monotonic()
-        elapsed = now - self._last_request
-        if elapsed < self._min_interval:
-            time.sleep(self._min_interval - elapsed)
-        self._last_request = time.monotonic()
+    # Apply exclusion filters
+    filtered = [c for c in unique_candidates if not should_exclude(c)]
+    excluded_count = len(unique_candidates) - len(filtered)
+    logger.info(f"After exclusion filters: {len(filtered)} (excluded {excluded_count})")
     
-    def _df_to_records(self, df) -> list:
-        """Convert a yfinance financial statement DataFrame to list of dicts."""
-        if df is None or df.empty:
-            return []
+    # Skip companies already in universe
+    new_candidates = [c for c in filtered if c.get("symbol") not in existing]
+    skipped_existing = len(filtered) - len(new_candidates)
+    logger.info(f"New candidates (not already in universe): {len(new_candidates)}")
+    
+    # Assign tier and metadata
+    for c in new_candidates:
+        c["tier"] = assign_tier(c)
+        c["refresh_days"] = TIER_DEFINITIONS[c["tier"]]["refresh_days"]
+    
+    # Build summary
+    tier_breakdown = {}
+    source_breakdown = {}
+    for c in new_candidates:
+        tier = c.get("tier", "unknown")
+        source = c.get("discovery_source", "unknown")
+        tier_breakdown[tier] = tier_breakdown.get(tier, 0) + 1
+        source_breakdown[source] = source_breakdown.get(source, 0) + 1
+    
+    # Insert into universe (or just report if dry_run)
+    added = 0
+    if not dry_run:
+        added = insert_into_universe(new_candidates)
+    
+    return {
+        "discovered": len(unique_candidates),
+        "filtered_out": excluded_count,
+        "skipped_existing": skipped_existing,
+        "added": added if not dry_run else len(new_candidates),
+        "dry_run": dry_run,
+        "tier_breakdown": tier_breakdown,
+        "source_breakdown": source_breakdown,
+    }
+
+
+# === DISCOVERY FUNCTIONS ===
+
+async def discover_breakout_zone() -> list[dict]:
+    """
+    Discover Tier 2 candidates: $500M-$10B market cap, profitable
+    or near-profitable, decent volume.
+    
+    This is the bulk of the expansion — the "next mega cap" hunting ground.
+    """
+    candidates = []
+    
+    # Run the screener in chunks to stay within result limits
+    # Chunk 1: $500M - $2B
+    chunk1 = await fmp_client.stock_screener(
+        market_cap_min=500_000_000,
+        market_cap_max=2_000_000_000,
+        price_min=5.0,
+        volume_min=200_000,
+        country="US",
+        exchange="nyse,nasdaq",
+        is_actively_trading=True,
+        limit=1000,
+    )
+    
+    if chunk1:
+        for company in chunk1:
+            candidates.append({
+                "symbol": company.get("symbol"),
+                "name": company.get("companyName"),
+                "market_cap": company.get("marketCap"),
+                "sector": company.get("sector"),
+                "industry": company.get("industry"),
+                "price": company.get("price"),
+                "discovery_source": "fmp_screener_breakout_zone_1",
+            })
+    
+    # Chunk 2: $2B - $10B
+    chunk2 = await fmp_client.stock_screener(
+        market_cap_min=2_000_000_000,
+        market_cap_max=10_000_000_000,
+        price_min=5.0,
+        volume_min=200_000,
+        country="US",
+        exchange="nyse,nasdaq",
+        is_actively_trading=True,
+        limit=1000,
+    )
+    
+    if chunk2:
+        for company in chunk2:
+            candidates.append({
+                "symbol": company.get("symbol"),
+                "name": company.get("companyName"),
+                "market_cap": company.get("marketCap"),
+                "sector": company.get("sector"),
+                "industry": company.get("industry"),
+                "price": company.get("price"),
+                "discovery_source": "fmp_screener_breakout_zone_2",
+            })
+    
+    return candidates
+
+
+async def discover_small_caps() -> list[dict]:
+    """
+    Discover Tier 3 candidates: $300M-$500M market cap.
+    
+    TRIMMED VERSION: Only the ~200 highest-volume names. These are
+    speculative microcaps that may cross the $500M breakout threshold
+    eventually. We crawl them at 14-day intervals for discovery value
+    only — most will never qualify for breakout scoring.
+    
+    Quality bars are HIGHER than other tiers because we're being
+    selective:
+    - Volume floor: 1M shares/day (vs 200K elsewhere)
+    - Price floor: $7 (vs $5 elsewhere)
+    """
+    result = await fmp_client.stock_screener(
+        market_cap_min=300_000_000,
+        market_cap_max=500_000_000,
+        price_min=7.0,            # Higher than other tiers
+        volume_min=1_000_000,     # 1M+ shares/day for real liquidity
+        country="US",
+        exchange="nyse,nasdaq",
+        is_actively_trading=True,
+        limit=300,                # Fetch 300 to allow for filtering
+    )
+    
+    if not result:
+        return []
+    
+    # Sort by volume descending and take top 200
+    result.sort(
+        key=lambda c: c.get("volume") or 0,
+        reverse=True
+    )
+    top_200 = result[:200]
+    
+    candidates = []
+    for company in top_200:
+        candidates.append({
+            "symbol": company.get("symbol"),
+            "name": company.get("companyName"),
+            "market_cap": company.get("marketCap"),
+            "sector": company.get("sector"),
+            "industry": company.get("industry"),
+            "price": company.get("price"),
+            "discovery_source": "fmp_screener_small_cap_top200",
+        })
+    
+    return candidates
+
+
+async def discover_sector_focused() -> list[dict]:
+    """
+    Discover sector-focused candidates in high-growth sectors,
+    regardless of market cap (within reasonable bounds).
+    
+    Focus sectors:
+    - Technology (AI, software, semis)
+    - Healthcare (biotech with revenue)
+    - Communication Services
+    - Consumer Discretionary (DTC, e-commerce)
+    """
+    candidates = []
+    
+    target_sectors = [
+        "Technology",
+        "Healthcare",
+        "Communication Services",
+        "Consumer Cyclical",  # FMP's name for consumer discretionary
+    ]
+    
+    for sector in target_sectors:
+        result = await fmp_client.stock_screener(
+            sector=sector,
+            market_cap_min=500_000_000,
+            market_cap_max=20_000_000_000,
+            price_min=5.0,
+            volume_min=200_000,
+            country="US",
+            exchange="nyse,nasdaq",
+            is_actively_trading=True,
+            limit=500,
+        )
         
-        records = []
-        for col in df.columns:
-            period_date = col.strftime("%Y-%m-%d") if hasattr(col, "strftime") else str(col)
-            record = {"period": period_date}
-            for idx in df.index:
-                val = df.loc[idx, col]
-                # Convert numpy types to Python native
-                if pd.isna(val):
-                    record[str(idx)] = None
-                elif hasattr(val, "item"):
-                    record[str(idx)] = val.item()
-                else:
-                    record[str(idx)] = val
-            records.append(record)
-        
-        return records
+        if result:
+            for company in result:
+                candidates.append({
+                    "symbol": company.get("symbol"),
+                    "name": company.get("companyName"),
+                    "market_cap": company.get("marketCap"),
+                    "sector": company.get("sector"),
+                    "industry": company.get("industry"),
+                    "price": company.get("price"),
+                    "discovery_source": f"fmp_screener_sector_{sector.lower().replace(' ', '_')}",
+                })
     
-    @staticmethod
-    def _compute_max_drawdown(prices) -> float:
-        """Compute maximum drawdown from a price series."""
-        peak = prices.expanding(min_periods=1).max()
-        drawdown = (prices - peak) / peak
-        return float(drawdown.min())
+    return candidates
+
+
+async def discover_recent_ipos() -> list[dict]:
+    """
+    Discover companies that IPO'd in the last 2 years.
+    
+    These are interesting because they're often missed by traditional
+    screeners and may not have stable fundamentals yet but have
+    high growth potential.
+    """
+    candidates = []
+    
+    try:
+        # Finnhub IPO calendar
+        from_date = (datetime.utcnow() - timedelta(days=730)).strftime("%Y-%m-%d")
+        to_date = datetime.utcnow().strftime("%Y-%m-%d")
+        
+        ipos = await finnhub_client.get_ipo_calendar(
+            from_date=from_date,
+            to_date=to_date
+        )
+        
+        if ipos and isinstance(ipos, dict):
+            ipo_list = ipos.get("ipoCalendar", [])
+        else:
+            ipo_list = ipos or []
+        
+        for ipo in ipo_list:
+            symbol = ipo.get("symbol")
+            exchange = ipo.get("exchange", "")
+            price = ipo.get("price")
+            
+            # Filter to NYSE/NASDAQ only
+            if not symbol or "NASDAQ" not in exchange.upper() and "NYSE" not in exchange.upper():
+                continue
+            
+            # Filter to companies that priced (not withdrawn)
+            if not price:
+                continue
+            
+            candidates.append({
+                "symbol": symbol,
+                "name": ipo.get("name"),
+                "market_cap": None,  # Not provided in IPO calendar
+                "sector": None,
+                "industry": None,
+                "price": None,
+                "discovery_source": "finnhub_ipo_calendar",
+                "discovery_metadata": {
+                    "ipo_date": ipo.get("date"),
+                    "exchange": exchange,
+                },
+            })
+    except Exception as e:
+        logger.warning(f"IPO discovery failed: {e}")
+    
+    return candidates
+
+
+# === FILTERING ===
+
+def should_exclude(candidate: dict) -> bool:
+    """Apply exclusion filters to a candidate."""
+    symbol = candidate.get("symbol", "")
+    name = (candidate.get("name") or "").lower()
+    
+    # Symbol suffix check (warrants, units, rights)
+    for suffix in EXCLUSION_FILTERS["symbol_suffixes"]:
+        if symbol.endswith(suffix):
+            return True
+    
+    # Name pattern check
+    for pattern in EXCLUSION_FILTERS["name_contains"]:
+        if pattern in name:
+            return True
+    
+    # Length sanity check
+    if len(symbol) > 5:
+        return True  # Probably not a regular common stock
+    
+    return False
+
+
+# === TIER ASSIGNMENT ===
+
+def assign_tier(candidate: dict) -> str:
+    """Assign a tier based on candidate characteristics."""
+    market_cap = candidate.get("market_cap") or 0
+    source = candidate.get("discovery_source", "")
+    
+    # IPOs go to their own tier
+    if "ipo" in source:
+        return "tier_4_ipo_discovery"
+    
+    # Small caps go to tier 3
+    if market_cap < 500_000_000:
+        return "tier_3_small_cap"
+    
+    # Breakout zone is the bulk
+    if market_cap < 10_000_000_000:
+        return "tier_2_breakout_zone"
+    
+    # Larger companies go to tier 1
+    return "tier_1_large_mid"
+
+
+# === DB OPERATIONS ===
+
+def get_existing_symbols() -> set:
+    """Get the set of symbols already in the universe."""
+    conn = get_db_connection()
+    rows = conn.execute("SELECT symbol FROM universe_symbols").fetchall()
+    return {row[0] for row in rows}
+
+
+def insert_into_universe(candidates: list[dict]) -> int:
+    """Insert new candidates into universe_symbols. Returns count inserted."""
+    conn = get_db_connection()
+    now = datetime.utcnow().isoformat()
+    
+    inserted = 0
+    for c in candidates:
+        try:
+            metadata_json = json.dumps(c.get("discovery_metadata") or {})
+            conn.execute("""
+                INSERT OR IGNORE INTO universe_symbols 
+                (symbol, name, sector, industry, market_cap, tier, 
+                 refresh_days, discovery_source, discovery_metadata, 
+                 added_at, last_screened_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """, (
+                c.get("symbol"),
+                c.get("name"),
+                c.get("sector"),
+                c.get("industry"),
+                c.get("market_cap"),
+                c.get("tier"),
+                c.get("refresh_days"),
+                c.get("discovery_source"),
+                metadata_json,
+                now,
+                now,
+            ))
+            inserted += conn.total_changes  # crude — adjust based on actual cursor
+        except Exception as e:
+            logger.warning(f"Failed to insert {c.get('symbol')}: {e}")
+    
+    conn.commit()
+    return inserted
 ```
 
-VERIFICATION:
-1. Start the service
-2. Test in Python shell:
+## Step 5: Add admin endpoint
+
 ```python
-import asyncio
-from data.yahoo_client import YahooFinanceClient
-client = YahooFinanceClient()
-data = asyncio.run(client.get_company_data("AAPL"))
-print(data.keys())
-print(data["profile"])
-print(len(data["income_statement"]["quarterly"]))
-print(data["key_stats"]["market_cap"])
+# In app/routes/routes_admin.py
+
+@router.post("/api/admin/expand-universe")
+async def expand_universe_endpoint(dry_run: bool = True):
+    """
+    Run the universe expansion pipeline.
+    
+    Default is dry_run=true so you see what WOULD be added before
+    committing. Pass dry_run=false to actually insert.
+    """
+    from app.services.universe_expansion import expand_universe
+    
+    result = await expand_universe(dry_run=dry_run)
+    return result
+
+
+@router.get("/api/admin/universe/stats")
+async def get_universe_stats():
+    """Get universe statistics broken down by tier and source."""
+    conn = get_db_connection()
+    
+    total = conn.execute("SELECT COUNT(*) FROM universe_symbols").fetchone()[0]
+    
+    by_tier = {}
+    rows = conn.execute("""
+        SELECT tier, COUNT(*) FROM universe_symbols GROUP BY tier
+    """).fetchall()
+    for tier, count in rows:
+        by_tier[tier or "unassigned"] = count
+    
+    by_source = {}
+    rows = conn.execute("""
+        SELECT discovery_source, COUNT(*) FROM universe_symbols 
+        GROUP BY discovery_source
+    """).fetchall()
+    for source, count in rows:
+        by_source[source or "legacy"] = count
+    
+    by_sector = {}
+    rows = conn.execute("""
+        SELECT sector, COUNT(*) FROM universe_symbols 
+        GROUP BY sector
+        ORDER BY COUNT(*) DESC
+    """).fetchall()
+    for sector, count in rows:
+        by_sector[sector or "unknown"] = count
+    
+    return {
+        "total": total,
+        "by_tier": by_tier,
+        "by_source": by_source,
+        "by_sector": by_sector,
+    }
 ```
 
-ACCEPTANCE CRITERIA:
-- Fetches all 7 data types for a company
-- Rate limiting prevents Yahoo from blocking
-- Individual fetch failures don't crash the whole request
-- data_quality field reflects completeness ("full", "partial", "degraded")
-- Financial statements returned as list of dicts (not DataFrames)
-- Price history includes computed metrics (return, volatility, max drawdown)
-- Insider transactions summarized with net activity signal
+## Step 6: First run — dry run
+
+Before doing anything irreversible, run the expansion in dry run
+mode to see what would happen:
+
+```bash
+curl -X POST "http://localhost:8100/api/admin/expand-universe?dry_run=true" | python -m json.tool
+```
+
+Expected output:
+```json
+{
+    "discovered": 4500,
+    "filtered_out": 800,
+    "skipped_existing": 600,
+    "added": 3100,
+    "dry_run": true,
+    "tier_breakdown": {
+        "tier_2_breakout_zone": 1800,
+        "tier_3_small_cap": 700,
+        "tier_4_ipo_discovery": 200,
+        "tier_1_large_mid": 400
+    },
+    "source_breakdown": {
+        "fmp_screener_breakout_zone_1": 1200,
+        "fmp_screener_breakout_zone_2": 800,
+        "fmp_screener_small_cap": 700,
+        "fmp_screener_sector_technology": 400,
+        "fmp_screener_sector_healthcare": 350,
+        "finnhub_ipo_calendar": 150
+    }
+}
+```
+
+**Verify the numbers make sense before doing the real run.**
+
+If the numbers look wrong:
+- Too few discovered → Check FMP screener parameters
+- Too many filtered out → Check exclusion filters (may be too aggressive)
+- Wrong tier distribution → Check `assign_tier()` logic
+
+## Step 7: Real run
+
+Once the dry run looks good:
+
+```bash
+curl -X POST "http://localhost:8100/api/admin/expand-universe?dry_run=false" | python -m json.tool
+```
+
+Then verify the universe stats:
+
+```bash
+curl "http://localhost:8100/api/admin/universe/stats" | python -m json.tool
+```
+
+Should show ~2,500 total symbols broken down by tier.
+
+## Step 8: Verify and monitor
+
+After expansion, the existing crawler will start picking up the
+new symbols using its current staleness-based ordering. The new
+symbols have no `evaluated_at` value yet, so the crawler should
+prioritize them naturally as "never evaluated" entries.
+
+Monitor progress:
+
+```bash
+# Check universe stats
+curl "http://localhost:8100/api/admin/universe/stats"
+
+# Check crawler progress
+curl "http://localhost:8100/api/admin/crawler/status"
+
+# After a day, check how many breakout candidates we found
+curl "http://localhost:8100/api/companies/ranked?sort=breakout&order=desc&limit=20" | python -m json.tool
+```
+
+The first few days will be evaluation-heavy as the crawler works
+through the new symbols. After 7-14 days, the breakout score
+distribution should be much richer because there are far more
+companies in the eligible market cap range.
+
+## Step 9: Watch for issues
+
+Things to watch for in the first few days:
+
+1. **Crawler keeping up** — The new symbols will surge into the
+   queue as "never evaluated." The crawler should chew through
+   them on its existing schedule. If processing is too slow we'll
+   tweak crawler behavior in a follow-up prompt.
+
+2. **API rate limits** — More symbols = more API calls. Watch for
+   429 errors from any provider.
+
+3. **Data quality on new symbols** — Small caps often have worse
+   data coverage. The breakout score's hard filters will reject
+   most, but watch for spurious high scores from incomplete data.
+
+4. **Storage growth** — 3x the symbols = ~3x the storage. The NAS
+   has plenty of room but monitor disk usage.
+
+5. **Disk I/O contention** — More writes during evaluation cycles.
+   The NAS WAL mode should handle this but watch for slowdowns.
+
+6. **The `tier` and `refresh_days` columns are populated for new
+   symbols only.** Existing 800 symbols will have NULL in these
+   fields. That's fine for now — they're just metadata that the
+   crawler isn't using yet. We'll backfill and wire them up in a
+   follow-up prompt.
+
+## Do NOT
+- Modify the BenTrade project
+- Modify the scoring logic
+- Modify the breakout score
+- Run the expansion in production without dry_run first
+- Add more than 2,500 symbols total — that's the target
+- Lower the quality bars (price > $5, volume > 200k) to inflate counts
+- Add OTC or pink sheet stocks
+- Add international stocks (US-only for now)

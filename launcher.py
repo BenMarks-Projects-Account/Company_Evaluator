@@ -470,6 +470,7 @@ class LauncherApp(tk.Tk):
         log_fh = open(LOG_FILE, "a", encoding="utf-8")
         env = os.environ.copy()
         env["PYTHONUNBUFFERED"] = "1"
+        env["SQLITE_TMPDIR"] = r"\\192.168.1.149\CompanyEvaluatorData\company_evaluator\sqlite_temp"
 
         self._process = subprocess.Popen(
             [PYTHON, "-m", "uvicorn", "main:app",
