@@ -47,6 +47,7 @@ _WEIGHTS = {
 
 def compute(data: dict) -> dict:
     quarterly = get_statements(data, "quarterly")
+    annual = get_statements(data, "annual")
     fh = get_finnhub_metrics(data)
     insiders = data.get("insider_transactions") or {}
     smart_money = data.get("smart_money") or {}
@@ -99,6 +100,14 @@ def compute(data: dict) -> dict:
         (shares_recent - shares_old) if (shares_recent and shares_old) else None,
         shares_old,
     )
+
+    # Fallback: use annual statement diluted_avg_shares
+    if share_trend is None and len(annual) >= 2:
+        s_new = annual[0].get("diluted_avg_shares")
+        s_old = (annual[2].get("diluted_avg_shares") if len(annual) >= 3
+                 else annual[-1].get("diluted_avg_shares"))
+        if s_new and s_old:
+            share_trend = safe_div(s_new - s_old, s_old)
 
     # --- Dividend Sustainability ---
     # Ideal payout: 20–60 %. 0 % or > 90 % is less ideal.

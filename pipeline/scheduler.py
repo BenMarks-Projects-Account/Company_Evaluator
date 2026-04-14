@@ -134,17 +134,20 @@ class CrawlerScheduler:
         cycle_number = state.get("cycle_number", 1)
         last_sym = state.get("last_completed_symbol")
 
-        if prev_status == "running":
+        # Resume from checkpoint for any halted state — "running" means the
+        # app was killed mid-cycle, "stopped" means the scheduler halted us
+        # (typically for market hours), "paused" means an explicit pause.
+        # All three carry a valid last_completed_index to resume from.
+        if prev_status in ("running", "stopped", "paused"):
             _log.info(
-                "Scheduler: market closed (%s), resuming crawler at index %d (last=%s)",
-                reason,
-                resume_idx,
-                last_sym,
+                "Scheduler: resuming crawler from checkpoint — "
+                "prev_status=%s resume_idx=%d last_sym=%s cycle=%d reason=%s",
+                prev_status, resume_idx, last_sym, cycle_number, reason,
             )
             asyncio.create_task(self.crawler.run(start_index=resume_idx, cycle_number=cycle_number))
             return
 
-        _log.info("Scheduler: market closed (%s), auto-starting crawler", reason)
+        _log.info("Scheduler: market closed (%s), auto-starting crawler (no checkpoint)", reason)
         asyncio.create_task(self.crawler.run())
 
     async def _monitor_loop(self):

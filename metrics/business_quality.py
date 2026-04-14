@@ -97,16 +97,13 @@ def compute(data: dict) -> dict:
     op_margin = safe_div(op_income_ttm, rev_ttm)
     net_margin = safe_div(ni_ttm, rev_ttm)
 
-    # Finnhub fallbacks (stored as percentages, e.g. 47.33 → 0.4733)
+    # Finnhub TTM fallbacks (TTM values are already decimals, e.g. 0.4733)
     if gross_margin is None:
-        v = fh.get("grossMarginTTM")
-        gross_margin = v / 100 if v is not None else None
+        gross_margin = fh.get("grossMarginTTM")
     if op_margin is None:
-        v = fh.get("operatingMarginTTM")
-        op_margin = v / 100 if v is not None else None
+        op_margin = fh.get("operatingMarginTTM")
     if net_margin is None:
-        v = fh.get("netProfitMarginTTM")
-        net_margin = v / 100 if v is not None else None
+        net_margin = fh.get("netProfitMarginTTM")
 
     # --- FCF Yield ---
     fcf_ttm = ttm_sum(quarterly, "free_cash_flow")

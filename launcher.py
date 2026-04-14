@@ -467,10 +467,25 @@ class LauncherApp(tk.Tk):
     # ── Backend process ───────────────────────────────────────
     def _start_backend(self):
         LOG_DIR.mkdir(exist_ok=True)
+
+        # Ensure SQLite temp directory exists on the NAS
+        sqlite_tmp = Path(r"\\192.168.1.149\CompanyEvaluatorData\company_evaluator\sqlite_temp")
+        try:
+            sqlite_tmp.mkdir(parents=True, exist_ok=True)
+        except Exception as e:
+            import logging
+            logging.getLogger(__name__).warning(
+                "Could not create SQLite temp directory %s: %s. "
+                "SQLite will fall back to the default temp location.", sqlite_tmp, e
+            )
+
         log_fh = open(LOG_FILE, "a", encoding="utf-8")
         env = os.environ.copy()
         env["PYTHONUNBUFFERED"] = "1"
         env["SQLITE_TMPDIR"] = r"\\192.168.1.149\CompanyEvaluatorData\company_evaluator\sqlite_temp"
+        # Windows uses TMP/TEMP for SQLite temp space — SQLITE_TMPDIR is Unix-only
+        env["TMP"] = r"\\192.168.1.149\CompanyEvaluatorData\company_evaluator\sqlite_temp"
+        env["TEMP"] = r"\\192.168.1.149\CompanyEvaluatorData\company_evaluator\sqlite_temp"
 
         self._process = subprocess.Popen(
             [PYTHON, "-m", "uvicorn", "main:app",

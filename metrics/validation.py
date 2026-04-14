@@ -32,7 +32,7 @@ METRIC_BOUNDS = {
     "revenue_cagr_3y": (-1.0, 2.0, "Revenue CAGR 3Y"),
     "revenue_cagr_5y": (-1.0, 2.0, "Revenue CAGR 5Y"),
     "fcf_growth": (-1.0, 2.0, "FCF growth"),
-    "eps_growth_yoy": (-5.0, 5.0, "EPS growth YoY"),
+    "eps_growth_yoy": (-100.0, 200.0, "EPS growth YoY"),
     "margin_trend": (-1.0, 1.0, "Margin trend"),
 
     # Valuation

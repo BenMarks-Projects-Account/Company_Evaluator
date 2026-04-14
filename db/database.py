@@ -196,6 +196,16 @@ def _set_sqlite_pragma(dbapi_connection, connection_record):
     cursor.execute("PRAGMA synchronous=NORMAL;")
     cursor.execute("PRAGMA busy_timeout=10000;")
     cursor.execute("PRAGMA cache_size=-64000;")
+    # Redirect SQLite temp storage to the NAS — Windows default temp is on C:
+    # which may run out of space. PRAGMA temp_store_directory is deprecated but
+    # is the only reliable runtime override on Windows (SQLITE_TMPDIR is Unix-only).
+    try:
+        cursor.execute(
+            "PRAGMA temp_store_directory = "
+            "'\\\\192.168.1.149\\CompanyEvaluatorData\\company_evaluator\\sqlite_temp'"
+        )
+    except Exception:
+        _log.warning("Failed to set SQLite temp_store_directory to NAS")
     cursor.close()
 
 async def init_db(database_url: str):

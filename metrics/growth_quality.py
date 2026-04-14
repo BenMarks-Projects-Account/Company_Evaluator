@@ -44,6 +44,32 @@ _WEIGHTS = {
 }
 
 
+def _safe_eps(stmt: dict) -> float | None:
+    """Extract EPS from a statement, preferring diluted."""
+    eps = stmt.get("eps_diluted")
+    if eps is not None:
+        return eps
+    eps = stmt.get("eps_basic")
+    if eps is not None:
+        return eps
+    ni = stmt.get("net_income")
+    shares = stmt.get("diluted_avg_shares")
+    if ni is not None and shares is not None and shares > 0:
+        return ni / shares
+    return None
+
+
+def _compute_eps_growth_yoy(annual: list[dict], fh: dict) -> float | None:
+    """Compute YoY EPS growth (pct), preferring Polygon annual EPS."""
+    if len(annual) >= 2:
+        eps_new = _safe_eps(annual[0])
+        eps_old = _safe_eps(annual[1])
+        if eps_new is not None and eps_old is not None and abs(eps_old) > 0.01:
+            return (eps_new - eps_old) / abs(eps_old) * 100
+    # Fallback: Finnhub epsGrowthTTMYoy (already in pct)
+    return fh.get("epsGrowthTTMYoy")
+
+
 def compute(data: dict) -> dict:
     annual = get_statements(data, "annual")
     fh = get_finnhub_metrics(data)
@@ -67,7 +93,7 @@ def compute(data: dict) -> dict:
         fcf_cagr = v / 100 if v is not None else None
 
     # --- EPS Growth ---
-    eps_growth = fh.get("epsGrowthTTMYoy")  # already in pct
+    eps_growth = _compute_eps_growth_yoy(annual, fh)
 
     # --- Operating Margin Trend ---
     # Change in trailing operating margin over ~3 years of annual data

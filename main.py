@@ -23,6 +23,7 @@ from api.routes_quote import router as quote_router
 from api.routes_transcripts import router as transcripts_router
 from api.routes_on_demand import router as on_demand_router
 from api.routes_charts import router as charts_router
+from api.routes_search import router as search_router
 
 # ── Logging setup (console + file) ──────────────────────────
 # Logs go to %LOCALAPPDATA%\CompanyEvaluator\logs to avoid OneDrive
@@ -49,42 +50,8 @@ logging.basicConfig(level=logging.INFO, handlers=[_console, _file])
 _log = logging.getLogger(__name__)
 
 
-async def _auto_resume_crawler(settings):
-    """Resume crawler ONLY if it was interrupted (status='running')."""
-    import asyncio
-    from pipeline.crawler import get_crawler, _load_state
-
-    state = _load_state()
-    if not state:
-        _log.info("No saved crawler state. Use the API/UI to start the crawler.")
-        return
-
-    prev_status = state.get("status")
-    last_idx = state.get("last_completed_index", -1)
-    last_sym = state.get("last_completed_symbol")
-    cycle_number = state.get("cycle_number", 1)
-    resume_idx = last_idx + 1
-
-    if prev_status == "stopped":
-        _log.info("Crawler was stopped by user (last: %s). Use the API/UI to restart.", last_sym)
-        return
-
-    if prev_status == "paused":
-        _log.info("Crawler was paused (last: %s). Use the API/UI to resume.", last_sym)
-        return
-
-    if prev_status != "running":
-        _log.info("Crawler state is '%s'. Use the API/UI to start.", prev_status)
-        return
-
-    # status == "running" — was interrupted, auto-resume
-    # Crawler will fetch its own ordered symbol list from DB
-    _log.info(
-        "RESUMING crawler: cycle %d, index %d (last completed: %s)",
-        cycle_number, resume_idx, last_sym,
-    )
-    crawler = get_crawler()
-    asyncio.create_task(crawler.run(start_index=resume_idx, cycle_number=cycle_number))
+# NOTE: Startup resume is handled by CrawlerScheduler._apply_current_schedule("startup").
+# No separate _auto_resume_crawler function needed.
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -166,6 +133,7 @@ app.include_router(quote_router, prefix="/api", tags=["quote"])
 app.include_router(transcripts_router, prefix="/api", tags=["transcripts"])
 app.include_router(on_demand_router, prefix="/api", tags=["on-demand"])
 app.include_router(charts_router, prefix="/api", tags=["charts"])
+app.include_router(search_router, prefix="/api", tags=["search"])
 
 @app.get("/health")
 async def health():

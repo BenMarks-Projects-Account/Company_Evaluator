@@ -31,7 +31,10 @@ PIPELINE_STEPS = [
     "Running entry point analysis",
     "Fetching price targets",
     "Analyzing earnings transcript",
-    "Generating LLM thesis and persisting",
+    "Generating LLM thesis",
+    "Generating business profile",
+    "Computing Piotroski F-Score",
+    "Persisting results",
 ]
 
 
@@ -308,8 +311,40 @@ async def run_on_demand_analysis(job_id: str, symbol: str):
         transcript = await _safe(analyze_transcript_safe, symbol)
         completed.append(PIPELINE_STEPS[8])
 
-        # ── Step 10: Finalize ────────────────────────────────────
+        # ── Step 10: LLM thesis (already generated inside evaluate_company) ──
         await _update_progress(job_id, 10, completed)
+        completed.append(PIPELINE_STEPS[9])
+
+        # ── Step 11: Business profile ────────────────────────────
+        await _update_progress(job_id, 11, completed)
+        if await _is_cancelled(job_id):
+            return
+
+        from analysis.business_profile import generate_business_profile
+        business_profile = await generate_business_profile(
+            symbol=symbol,
+            profile=profile,
+            evaluation=eval_result,
+            comps=comps_result,
+        )
+        completed.append(PIPELINE_STEPS[10])
+
+        # ── Step 12: Piotroski F-Score ───────────────────────────
+        await _update_progress(job_id, 12, completed)
+
+        from analysis.piotroski import compute_piotroski_score
+        from metrics.helpers import get_statements
+
+        # Extract annual statements from the persisted raw financials
+        db_eval_for_piotroski = await _fetch_db_evaluation(symbol)
+        raw_fin = _parse_json((db_eval_for_piotroski or {}).get("raw_financials"))
+        cd = raw_fin.get("company_data", raw_fin)
+        annual_stmts = get_statements(cd, "annual")
+        piotroski_result = compute_piotroski_score(annual_stmts)
+        completed.append(PIPELINE_STEPS[11])
+
+        # ── Step 13: Persist results ─────────────────────────────
+        await _update_progress(job_id, 13, completed)
 
         # Ensure symbol is in universe
         was_in_universe, tier = await _ensure_in_universe(symbol, profile, eval_result)
@@ -332,12 +367,14 @@ async def run_on_demand_analysis(job_id: str, symbol: str):
             entry=entry_result,
             price_targets=price_targets,
             transcript=transcript,
+            business_profile=business_profile,
+            piotroski=piotroski_result,
             was_in_universe=was_in_universe,
             tier=tier,
             duration=duration,
         )
 
-        completed.append(PIPELINE_STEPS[9])
+        completed.append(PIPELINE_STEPS[12])
         await _mark_complete(job_id, payload)
         _log.info(
             "On-demand analysis complete: %s (job=%s) in %.1fs",
@@ -629,6 +666,8 @@ def _build_result_payload(
     entry: dict | None,
     price_targets: dict | None,
     transcript: dict | None,
+    business_profile: dict | None,
+    piotroski: dict | None,
     was_in_universe: bool,
     tier: str,
     duration: float,
@@ -700,6 +739,8 @@ def _build_result_payload(
         "entry_analysis": entry,
         "price_targets": price_targets,
         "transcript": transcript,
+        "business_profile": business_profile,
+        "piotroski_f_score": piotroski,
         "raw_financials": raw_financials,
 
         "data_sources": {

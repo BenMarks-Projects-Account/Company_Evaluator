@@ -254,6 +254,43 @@ class FMPClient:
             return result
         return None
 
+    async def search_symbol(
+        self,
+        query: str,
+        limit: int = 10,
+        exchange: str = "NASDAQ,NYSE,AMEX",
+    ) -> list[dict] | None:
+        """FMP ticker search — matches by ticker prefix.
+
+        Uses /stable/search-symbol. Returns list of dicts with keys:
+        symbol, name, currency, exchangeFullName, exchange. Or None on failure.
+        """
+        params = {"query": query, "limit": limit}
+        if exchange:
+            params["exchange"] = exchange
+        result = await self._request("/stable/search-symbol", params=params)
+        if isinstance(result, list):
+            return result
+        return None
+
+    async def search_name(
+        self,
+        query: str,
+        limit: int = 10,
+        exchange: str = "NASDAQ,NYSE,AMEX",
+    ) -> list[dict] | None:
+        """FMP company name search — matches by company name substring.
+
+        Uses /stable/search-name. Returns same shape as search_symbol.
+        """
+        params = {"query": query, "limit": limit}
+        if exchange:
+            params["exchange"] = exchange
+        result = await self._request("/stable/search-name", params=params)
+        if isinstance(result, list):
+            return result
+        return None
+
     # ── HTTP layer ───────────────────────────────────────────
 
     async def _request(self, path: str, params: dict | None = None):

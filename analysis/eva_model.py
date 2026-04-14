@@ -328,9 +328,11 @@ def _extract_base_data(profile: dict, metrics: dict) -> tuple[dict, list[str]]:
     roa = roa_raw / 100 if roa_raw is not None else None
 
     # Margins (as decimals)
-    gross_margin = metrics.get("grossMarginTTM") or metrics.get("grossMarginAnnual")
-    if gross_margin is not None:
-        gross_margin = gross_margin / 100
+    # TTM values are already decimals (e.g. 0.4733); Annual are percentages (e.g. 47.33)
+    gross_margin = metrics.get("grossMarginTTM")
+    if gross_margin is None:
+        v = metrics.get("grossMarginAnnual")
+        gross_margin = v / 100 if v is not None else None
 
     net_margin_dec = net_margin / 100 if net_margin else None
 
