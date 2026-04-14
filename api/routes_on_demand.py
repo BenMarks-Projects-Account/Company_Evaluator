@@ -11,9 +11,11 @@ from pipeline.on_demand import (
     create_job,
     get_job,
     get_job_result,
+    get_recent_result_by_symbol,
     cancel_job,
     run_on_demand_analysis,
 )
+from analysis.research_prompt_template import build_research_prompt
 
 router = APIRouter()
 _log = logging.getLogger(__name__)
@@ -78,3 +80,46 @@ async def cancel_job_endpoint(job_id: str):
     if not success:
         raise HTTPException(404, f"Job {job_id} not found or already finished")
     return {"status": "cancelled"}
+
+
+@router.get("/on-demand/research-prompt/{symbol}")
+async def get_research_prompt(symbol: str):
+    """Generate a deep research prompt from the most recent evaluation."""
+    symbol = symbol.upper().strip()
+    if not _SYMBOL_RE.match(symbol):
+        raise HTTPException(400, f"Invalid symbol format: {symbol}")
+
+    result = await get_recent_result_by_symbol(symbol, max_age_hours=24)
+    if not result:
+        return {
+            "ok": False,
+            "symbol": symbol,
+            "error": "No recent evaluation found. Run an on-demand analysis first.",
+        }
+
+    from datetime import datetime, timezone
+
+    completed_at = result.pop("_completed_at", None)
+    age_seconds = None
+    if completed_at:
+        try:
+            ts = completed_at.rstrip("Z")
+            if "+" not in ts and not ts.endswith("00:00"):
+                ts += "+00:00"
+            dt = datetime.fromisoformat(ts)
+            age_seconds = (datetime.now(timezone.utc) - dt).total_seconds()
+        except Exception:
+            pass
+
+    company = result.get("company") or {}
+    prompt_text = build_research_prompt(result)
+
+    return {
+        "ok": True,
+        "symbol": symbol,
+        "company_name": company.get("name", symbol),
+        "prompt": prompt_text,
+        "generated_at": datetime.now(timezone.utc).isoformat() + "Z",
+        "data_freshness": completed_at,
+        "evaluation_age_seconds": round(age_seconds) if age_seconds else None,
+    }

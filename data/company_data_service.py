@@ -264,8 +264,19 @@ class CompanyDataService:
                 "_source": "fmp_smart_money",
             }
 
+        # === FMP PROFILE: Clean sector/industry labels ===
+        fmp_profile = None
+        if self._fmp:
+            fmp_profile = await self._safe(
+                "fmp_profile", self._fmp.get_company_profile, symbol,
+                provider="fmp",
+                endpoint="/v3/profile/{symbol}",
+                source_attribution=source_attribution,
+                fetch_errors=fetch_errors,
+            )
+
         # === MERGE PROFILE from best source ===
-        merged_profile = self._merge_profile(company_details, profile, yahoo_ownership)
+        merged_profile = self._merge_profile(company_details, profile, yahoo_ownership, fmp_profile=fmp_profile)
 
         # === BUILD UNIFIED RESULT ===
         result = {
@@ -300,11 +311,12 @@ class CompanyDataService:
         )
         return result
 
-    def _merge_profile(self, polygon_details, finnhub_profile, yahoo_ownership=None) -> dict:
+    def _merge_profile(self, polygon_details, finnhub_profile, yahoo_ownership=None, fmp_profile=None) -> dict:
         """Merge company profile from multiple sources.
 
         Polygon is PRIMARY (paid tier has reliable market_cap, description,
-        employees). Finnhub supplements with sector/industry names.
+        employees). FMP provides clean sector/industry labels.
+        Finnhub supplements with country and fallback fields.
         """
         merged = {
             "company_name": None,
@@ -323,25 +335,30 @@ class CompanyDataService:
 
         pg = polygon_details if polygon_details and not polygon_details.get("error") else {}
         fh = finnhub_profile if finnhub_profile and not finnhub_profile.get("error") else {}
+        fmp = fmp_profile if fmp_profile and not fmp_profile.get("error") else {}
 
         # Polygon details (primary for name, market_cap, description, employees)
         if pg:
             merged["company_name"] = pg.get("company_name")
-            merged["sector"] = pg.get("sector")
             merged["market_cap"] = pg.get("market_cap")
             merged["description"] = pg.get("description")
             merged["employees"] = pg.get("employees")
             merged["website"] = pg.get("homepage")
             merged["exchange"] = pg.get("primary_exchange")
 
-        # Finnhub fills gaps (better sector names, country)
+        # Sector & Industry: FMP first (clean labels), then Finnhub, then Polygon SIC
+        fmp_sector = fmp.get("sector") if fmp else None
+        fmp_industry = fmp.get("industry") if fmp else None
+        fh_sector = fh.get("sector") if fh else None  # finnhubIndustry
+        pg_sic = pg.get("sector") if pg else None  # raw SIC description
+
+        merged["sector"] = fmp_sector or fh_sector or pg_sic or None
+        merged["industry"] = fmp_industry or fh_sector or pg_sic or None
+
+        # Finnhub fills gaps (name, market_cap, country)
         if fh:
             if not merged["company_name"]:
                 merged["company_name"] = fh.get("company_name")
-            if not merged["sector"] or merged["sector"] == pg.get("sector"):
-                fh_sector = fh.get("sector")
-                if fh_sector:
-                    merged["sector"] = fh_sector
             if not merged["market_cap"]:
                 mc = fh.get("market_cap")
                 if mc:
@@ -352,8 +369,19 @@ class CompanyDataService:
             if not merged["exchange"]:
                 merged["exchange"] = fh.get("exchange")
 
-        # Industry: prefer Polygon SIC description, fall back to Finnhub
-        merged["industry"] = pg.get("sector") or fh.get("sector")
+        # FMP fills remaining gaps
+        if fmp:
+            if not merged["company_name"]:
+                merged["company_name"] = fmp.get("company_name")
+            if not merged["employees"]:
+                emp = fmp.get("employees")
+                if emp:
+                    try:
+                        merged["employees"] = int(emp)
+                    except (TypeError, ValueError):
+                        pass
+            if not merged["country"]:
+                merged["country"] = fmp.get("country")
 
         # Shares outstanding: prefer Finnhub (always present), no Polygon equivalent in this endpoint
         fh_shares = fh.get("shares_outstanding")

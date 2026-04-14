@@ -43,6 +43,25 @@ class FMPClient:
 
     # ── Cross-validation endpoints (Tier 2) ──────────────────
 
+    async def get_company_profile(self, symbol: str) -> dict | None:
+        """Fetch company profile with clean sector/industry labels."""
+        data = await self._request(f"/stable/profile", params={"symbol": symbol})
+        if data and isinstance(data, list) and len(data) > 0:
+            item = data[0]
+            return {
+                "symbol": item.get("symbol"),
+                "company_name": item.get("companyName"),
+                "sector": item.get("sector"),
+                "industry": item.get("industry"),
+                "market_cap": item.get("mktCap"),
+                "description": item.get("description"),
+                "employees": item.get("fullTimeEmployees"),
+                "website": item.get("website"),
+                "country": item.get("country"),
+                "exchange": item.get("exchangeShortName"),
+            }
+        return None
+
     async def get_key_metrics_ttm(self, symbol: str) -> dict | None:
         """Fetch TTM key metrics (ROIC, netIncomePerShare, etc.)."""
         data = await self._request("/key-metrics-ttm", params={"symbol": symbol})

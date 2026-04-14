@@ -28,6 +28,7 @@ PIPELINE_STEPS = [
     "Running DCF valuation",
     "Running EVA/ROIC analysis",
     "Running comparable company analysis",
+    "Computing Earnings Power Value",
     "Running entry point analysis",
     "Fetching price targets",
     "Analyzing earnings transcript",
@@ -118,6 +119,30 @@ async def get_job_result(job_id: str) -> dict | None:
         if not row:
             return None
         return json.loads(row)
+
+
+async def get_recent_result_by_symbol(
+    symbol: str, max_age_hours: int = 24
+) -> dict | None:
+    """Return the most recent complete result for *symbol* within *max_age_hours*."""
+    cutoff = (datetime.now(timezone.utc) - timedelta(hours=max_age_hours)).isoformat()
+    async with get_session() as session:
+        result = await session.execute(
+            select(OnDemandJob)
+            .where(
+                OnDemandJob.symbol == symbol.upper(),
+                OnDemandJob.status == "complete",
+                OnDemandJob.completed_at > cutoff,
+            )
+            .order_by(OnDemandJob.completed_at.desc())
+            .limit(1)
+        )
+        row = result.scalar_one_or_none()
+        if not row or not row.result_json:
+            return None
+        data = json.loads(row.result_json)
+        data["_completed_at"] = row.completed_at
+        return data
 
 
 async def cancel_job(job_id: str) -> bool:
@@ -287,36 +312,74 @@ async def run_on_demand_analysis(job_id: str, symbol: str):
         await _update_progress(job_id, 6, completed)
         completed.append(PIPELINE_STEPS[5])  # Comps
 
-        # ── Step 7: Entry point analysis ─────────────────────────
+        # ── Step 7: Earnings Power Value ─────────────────────────
         await _update_progress(job_id, 7, completed)
-        if await _is_cancelled(job_id):
-            return
 
-        entry_result = await _safe(analyze_entry_safe, symbol)
-        completed.append(PIPELINE_STEPS[6])
+        from analysis.epv_model import compute_epv
+        from metrics.helpers import get_statements as _get_stmts
 
-        # ── Step 8: Price targets ────────────────────────────────
+        # Extract WACC from prior valuation results — DCF first, EVA fallback
+        wacc_for_epv = None
+        if dcf_result and dcf_result.get("ok"):
+            wacc_for_epv = (dcf_result.get("inputs") or {}).get("wacc")
+        if wacc_for_epv is None and eva_result and eva_result.get("ok"):
+            wacc_for_epv = (eva_result.get("wacc") or {}).get("wacc")
+
+        # Get annual statements from persisted raw financials
+        _db_eval_epv = await _fetch_db_evaluation(symbol)
+        _raw_fin_epv = _parse_json((_db_eval_epv or {}).get("raw_financials"))
+        _cd_epv = _raw_fin_epv.get("company_data", _raw_fin_epv)
+        annual_for_epv = _get_stmts(_cd_epv, "annual")
+
+        # Get diluted shares from the most recent annual record
+        diluted_shares_epv = None
+        if annual_for_epv:
+            diluted_shares_epv = annual_for_epv[0].get("diluted_avg_shares")
+
+        # Derive current price — prefer profile snapshot, fallback to market_cap/shares
+        price_for_epv = profile.get("price")
+        if not price_for_epv and profile.get("market_cap") and diluted_shares_epv:
+            price_for_epv = profile["market_cap"] / diluted_shares_epv
+
+        epv_result = compute_epv(
+            annual=annual_for_epv,
+            wacc=wacc_for_epv,
+            market_cap=profile.get("market_cap"),
+            current_price=price_for_epv,
+            diluted_shares=diluted_shares_epv,
+        )
+        completed.append(PIPELINE_STEPS[6])  # EPV
+
+        # ── Step 8: Entry point analysis ─────────────────────────
         await _update_progress(job_id, 8, completed)
         if await _is_cancelled(job_id):
             return
 
-        price_targets = await _safe(fetch_price_targets_safe, symbol)
+        entry_result = await _safe(analyze_entry_safe, symbol)
         completed.append(PIPELINE_STEPS[7])
 
-        # ── Step 9: Transcript analysis ──────────────────────────
+        # ── Step 9: Price targets ────────────────────────────────
         await _update_progress(job_id, 9, completed)
         if await _is_cancelled(job_id):
             return
 
-        transcript = await _safe(analyze_transcript_safe, symbol)
+        price_targets = await _safe(fetch_price_targets_safe, symbol)
         completed.append(PIPELINE_STEPS[8])
 
-        # ── Step 10: LLM thesis (already generated inside evaluate_company) ──
+        # ── Step 10: Transcript analysis ─────────────────────────
         await _update_progress(job_id, 10, completed)
+        if await _is_cancelled(job_id):
+            return
+
+        transcript = await _safe(analyze_transcript_safe, symbol)
         completed.append(PIPELINE_STEPS[9])
 
-        # ── Step 11: Business profile ────────────────────────────
+        # ── Step 11: LLM thesis (already generated inside evaluate_company) ──
         await _update_progress(job_id, 11, completed)
+        completed.append(PIPELINE_STEPS[10])
+
+        # ── Step 12: Business profile ────────────────────────────
+        await _update_progress(job_id, 12, completed)
         if await _is_cancelled(job_id):
             return
 
@@ -327,24 +390,19 @@ async def run_on_demand_analysis(job_id: str, symbol: str):
             evaluation=eval_result,
             comps=comps_result,
         )
-        completed.append(PIPELINE_STEPS[10])
-
-        # ── Step 12: Piotroski F-Score ───────────────────────────
-        await _update_progress(job_id, 12, completed)
-
-        from analysis.piotroski import compute_piotroski_score
-        from metrics.helpers import get_statements
-
-        # Extract annual statements from the persisted raw financials
-        db_eval_for_piotroski = await _fetch_db_evaluation(symbol)
-        raw_fin = _parse_json((db_eval_for_piotroski or {}).get("raw_financials"))
-        cd = raw_fin.get("company_data", raw_fin)
-        annual_stmts = get_statements(cd, "annual")
-        piotroski_result = compute_piotroski_score(annual_stmts)
         completed.append(PIPELINE_STEPS[11])
 
-        # ── Step 13: Persist results ─────────────────────────────
+        # ── Step 13: Piotroski F-Score ───────────────────────────
         await _update_progress(job_id, 13, completed)
+
+        from analysis.piotroski import compute_piotroski_score
+
+        # Reuse annual statements from EPV step (already fetched)
+        piotroski_result = compute_piotroski_score(annual_for_epv)
+        completed.append(PIPELINE_STEPS[12])
+
+        # ── Step 14: Persist results ─────────────────────────────
+        await _update_progress(job_id, 14, completed)
 
         # Ensure symbol is in universe
         was_in_universe, tier = await _ensure_in_universe(symbol, profile, eval_result)
@@ -364,6 +422,7 @@ async def run_on_demand_analysis(job_id: str, symbol: str):
             dcf=dcf_result,
             eva=eva_result,
             comps=comps_result,
+            epv=epv_result,
             entry=entry_result,
             price_targets=price_targets,
             transcript=transcript,
@@ -374,7 +433,7 @@ async def run_on_demand_analysis(job_id: str, symbol: str):
             duration=duration,
         )
 
-        completed.append(PIPELINE_STEPS[12])
+        completed.append(PIPELINE_STEPS[13])
         await _mark_complete(job_id, payload)
         _log.info(
             "On-demand analysis complete: %s (job=%s) in %.1fs",
@@ -515,6 +574,7 @@ async def _fetch_profile(symbol: str) -> dict | None:
             _log.warning("Polygon profile fetch failed for %s: %s", symbol, exc)
 
     # Finnhub enrichment
+    fh_sector = None
     if settings.finnhub_api_key:
         try:
             fh = FinnhubClient(settings.finnhub_api_key, settings.finnhub_rate_limit)
@@ -522,11 +582,39 @@ async def _fetch_profile(symbol: str) -> dict | None:
             if fh_profile and not fh_profile.get("error"):
                 if not profile.get("name"):
                     profile["name"] = fh_profile.get("name")
+                fh_sector = fh_profile.get("sector")  # finnhubIndustry
                 profile.setdefault("ipo_date", fh_profile.get("ipo"))
                 profile.setdefault("currency", fh_profile.get("currency", "USD"))
                 profile.setdefault("country", fh_profile.get("country"))
         except Exception as exc:
             _log.warning("Finnhub profile fetch failed for %s: %s", symbol, exc)
+
+    # FMP profile — clean sector/industry labels (priority over Polygon SIC)
+    fmp_sector, fmp_industry = None, None
+    if settings.fmp_api_key:
+        try:
+            from data.fmp_client import FMPClient
+            fmp = FMPClient(settings.fmp_api_key)
+            fmp_profile = await fmp.get_company_profile(symbol)
+            if fmp_profile and not fmp_profile.get("error"):
+                fmp_sector = fmp_profile.get("sector")
+                fmp_industry = fmp_profile.get("industry")
+                if not profile.get("name"):
+                    profile["name"] = fmp_profile.get("company_name")
+                if not profile.get("employees"):
+                    emp = fmp_profile.get("employees")
+                    if emp:
+                        try:
+                            profile["employees"] = int(emp)
+                        except (ValueError, TypeError):
+                            pass
+        except Exception as exc:
+            _log.warning("FMP profile fetch failed for %s: %s", symbol, exc)
+
+    # Sector/Industry: FMP (clean labels) → Finnhub → Polygon SIC
+    pg_sic = profile.get("sector")  # currently set from Polygon SIC description
+    profile["sector"] = fmp_sector or fh_sector or pg_sic or None
+    profile["industry"] = fmp_industry or fh_sector or pg_sic or None
 
     # Current price from Polygon snapshot
     if settings.polygon_api_key:
@@ -663,6 +751,7 @@ def _build_result_payload(
     dcf: dict | None,
     eva: dict | None,
     comps: dict | None,
+    epv: dict | None,
     entry: dict | None,
     price_targets: dict | None,
     transcript: dict | None,
@@ -736,6 +825,7 @@ def _build_result_payload(
         "dcf": dcf,
         "eva": eva,
         "comps": comps,
+        "epv": epv,
         "entry_analysis": entry,
         "price_targets": price_targets,
         "transcript": transcript,

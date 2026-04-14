@@ -7,6 +7,7 @@ only — NOT from the crawler.
 
 import json
 import logging
+import re
 from datetime import datetime, timezone
 
 from analysis.llm_client import call_llm
@@ -29,7 +30,8 @@ Avoid:
 Prioritize:
 - Specific examples and numbers where available
 - Differentiation from named competitors
-- Business-model-specific risks (not "macro conditions")"""
+- Business-model-specific risks (not "macro conditions")
+- For direct_competitors: use PLAIN COMPANY NAMES ONLY (e.g. "Bristol-Myers Squibb", "Merck & Co"). Do NOT include ticker symbols like "(BMY)" or "(MRK)" in any form."""
 
 
 USER_PROMPT_TEMPLATE = """Analyze the following company and return a JSON object matching the schema below.
@@ -69,7 +71,7 @@ Return this exact JSON schema (all fields required, use null for unknown values)
     "signals": ["list", "of", "specific", "evidence"]
   }},
   "competitive_landscape": {{
-    "direct_competitors": ["list", "of", "company", "names"],
+    "direct_competitors": ["plain company names only — NO ticker symbols, NO parenthetical abbreviations"],
     "differentiation": "string — what makes this company different",
     "market_position": "LEADER | CHALLENGER | NICHE | FOLLOWER"
   }},
@@ -148,6 +150,11 @@ async def generate_business_profile(
     missing = [f for f in required if f not in parsed]
     if missing:
         _log.warning("[business_profile] LLM missing fields for %s: %s", symbol, missing)
+
+    # Post-process: strip ticker symbols from competitor names
+    cl = parsed.get("competitive_landscape")
+    if isinstance(cl, dict):
+        cl["direct_competitors"] = _clean_competitors(cl.get("direct_competitors"))
 
     _log.info("event=business_profile_complete symbol=%s confidence=%s", symbol, parsed.get("confidence"))
 
@@ -329,3 +336,39 @@ def _parse_llm_response(text: str) -> dict:
         return obj
     except json.JSONDecodeError as e:
         raise ValueError(f"Extracted JSON failed to parse: {e}")
+
+
+# ── Competitor name cleanup ──────────────────────────────────
+
+# Match "(ABCD)", "[ABCD]", or trailing bare " ABCD" at end of string
+_TICKER_PAREN_RE = re.compile(r'\s*[\(\[][A-Z]{1,5}[\)\]]\s*$')
+_TICKER_BARE_RE = re.compile(r'\s+[A-Z]{2,5}\s*$')
+
+
+def _strip_ticker_from_name(name: str) -> str:
+    """Remove ticker symbol annotations from a company name."""
+    if not name:
+        return name
+    cleaned = _TICKER_PAREN_RE.sub('', name).strip()
+    # Only strip bare trailing caps if the remaining text still looks like a name
+    # (has at least one lowercase letter — avoids stripping from all-caps names)
+    if cleaned and any(c.islower() for c in cleaned):
+        cleaned = _TICKER_BARE_RE.sub('', cleaned).strip()
+    return cleaned
+
+
+def _clean_competitors(competitor_list) -> list[str]:
+    """Strip ticker symbols from a list of competitor names."""
+    if not competitor_list:
+        return []
+    cleaned = []
+    for comp in competitor_list:
+        if isinstance(comp, str):
+            stripped = _strip_ticker_from_name(comp)
+            if stripped:
+                cleaned.append(stripped)
+        elif isinstance(comp, dict) and comp.get("name"):
+            stripped = _strip_ticker_from_name(comp["name"])
+            if stripped:
+                cleaned.append(stripped)
+    return cleaned

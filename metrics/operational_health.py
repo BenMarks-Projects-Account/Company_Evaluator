@@ -86,9 +86,22 @@ def compute(data: dict) -> dict:
             debt_ebitda = safe_div(total_debt, ebitda_approx)
 
     # --- Interest Coverage ---
-    interest_cov = fh.get("netInterestCoverageTTM")
-    # Cap extreme values for scoring stability
-    if interest_cov is not None:
+    # Compute from statements first (operating_income / interest_expense)
+    interest_exp = abs(ttm_sum(quarterly, "interest_expense") or 0)
+    NO_DEBT_THRESHOLD = 1_000_000  # $1M — below this, treat as essentially no debt
+    if op_inc_ttm is not None and interest_exp >= NO_DEBT_THRESHOLD and op_inc_ttm > 0:
+        interest_cov = op_inc_ttm / interest_exp
+    elif op_inc_ttm is not None and interest_exp < NO_DEBT_THRESHOLD:
+        interest_cov = "no_debt"
+    else:
+        # Finnhub fallback
+        interest_cov = fh.get("netInterestCoverageTTM")
+        if interest_cov is not None and interest_cov == 0:
+            # Finnhub returns 0 for low-debt companies — check if it's really no debt
+            if interest_exp < NO_DEBT_THRESHOLD:
+                interest_cov = "no_debt"
+    # Cap extreme numeric values for scoring stability
+    if isinstance(interest_cov, (int, float)) and interest_cov is not None:
         interest_cov = min(interest_cov, 100.0)
 
     # --- Current Ratio ---
@@ -141,7 +154,12 @@ def rescore_from_metrics(metrics: dict, raw_metrics: dict | None = None) -> dict
 
     scores = {}
     for k in _BOUNDS:
-        scores[k] = score(validated_metrics.get(k), *_BOUNDS[k], invert=(k in _INVERTED))
+        v = validated_metrics.get(k)
+        # "no_debt" sentinel for interest_coverage → perfect score
+        if k == "interest_coverage" and v == "no_debt":
+            scores[k] = 100.0
+        else:
+            scores[k] = score(v, *_BOUNDS[k], invert=(k in _INVERTED))
 
     raw_score, completeness_pct = weighted_avg([(scores[k], _WEIGHTS[k]) for k in _WEIGHTS])
     pillar_score = apply_completeness_cap(raw_score, completeness_pct)
@@ -164,4 +182,8 @@ def rescore_from_metrics(metrics: dict, raw_metrics: dict | None = None) -> dict
 
 
 def _r(v, decimals=4):
-    return round(v, decimals) if v is not None else None
+    if v is None:
+        return None
+    if isinstance(v, str):
+        return v  # pass through sentinel values like "no_debt"
+    return round(v, decimals)
