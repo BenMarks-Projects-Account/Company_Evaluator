@@ -10,7 +10,7 @@ import logging
 import re
 import time
 from dataclasses import dataclass
-from datetime import datetime, date
+from datetime import datetime, date, timedelta
 from typing import Optional, List, Tuple
 
 import requests
@@ -233,7 +233,7 @@ class BulkFetcher:
         """Expand parameterized endpoints into concrete fetch calls."""
         calls: List[Tuple[BulkEndpoint, dict]] = []
         current_year = datetime.now().year
-        today = date.today().isoformat()
+        eod_date = self._last_business_day()
 
         for endpoint in BULK_ENDPOINTS:
             if endpoint.paginated:
@@ -245,8 +245,21 @@ class BulkFetcher:
                     year = current_year - 1 - offset
                     calls.append((endpoint, {"year": year}))
             elif "{date}" in endpoint.url_template:
-                calls.append((endpoint, {"date_str": today}))
+                calls.append((endpoint, {"date_str": eod_date}))
             else:
                 calls.append((endpoint, {}))
 
         return calls
+
+    @staticmethod
+    def _last_business_day() -> str:
+        """Return the most recent weekday (Mon-Fri) before today.
+
+        EOD bulk data is only available after a market's close.
+        At overnight-crawl time (2 AM), today's US data doesn't
+        exist yet, so we always use the previous business day.
+        """
+        d = date.today() - timedelta(days=1)
+        while d.weekday() >= 5:  # Saturday=5, Sunday=6
+            d -= timedelta(days=1)
+        return d.isoformat()

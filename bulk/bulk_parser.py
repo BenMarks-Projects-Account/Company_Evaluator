@@ -57,6 +57,20 @@ class BulkParser:
             )
 
         try:
+            # Guard against JSON error responses (e.g. rate-limit messages
+            # that FMP sometimes returns with status 200)
+            text = fetch_result.csv_text.strip()
+            if text.startswith('{') or text.startswith('['):
+                return ParseResult(
+                    endpoint_name=fetch_result.endpoint_name,
+                    part=fetch_result.part,
+                    year=fetch_result.year,
+                    dataframe=None,
+                    original_row_count=0,
+                    filtered_row_count=0,
+                    error=f"Response is JSON, not CSV: {text[:120]}",
+                )
+
             df = pd.read_csv(io.StringIO(fetch_result.csv_text), low_memory=False)
             original_count = len(df)
 
@@ -76,8 +90,8 @@ class BulkParser:
                     ),
                 )
 
-            # Normalize symbol case and filter to universe
-            df[symbol_col] = df[symbol_col].astype(str).str.upper()
+            # Normalize symbol case, strip whitespace, and filter to universe
+            df[symbol_col] = df[symbol_col].astype(str).str.upper().str.strip()
             df_filtered = df[df[symbol_col].isin(self.universe)].copy()
             filtered_count = len(df_filtered)
 
