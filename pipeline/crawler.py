@@ -11,11 +11,10 @@ from config import get_settings
 
 _log = logging.getLogger(__name__)
 
-# Recompute global rankings every N symbols during a crawl instead of
-# after every symbol. Per-symbol rankings recompute costs ~15s on a
-# ~2k-row DB; batching brings that to ~0.15s/symbol amortized while
-# keeping rankings reasonably fresh for the UI.
-RANKINGS_UPDATE_INTERVAL = 100
+# Interval is read from settings.rankings_update_interval (default 50).
+# The SQL rewrite makes a full rankings update ~0.5s, so firing every
+# 50 symbols adds ~0.01s/symbol amortized while keeping the leaderboard
+# fresh during multi-hour continuous crawls.
 
 
 def _get_state_file() -> Path:
@@ -191,6 +190,8 @@ class Crawler:
         self._start_time = time.time()
         settings = get_settings()
         pause_sec = settings.pause_between_symbols_sec
+        rankings_interval = settings.rankings_update_interval
+        symbols_since_last_ranking = 0
 
         # Load symbols from DB (ordered by staleness) if not provided
         if symbols is None:
@@ -273,6 +274,19 @@ class Crawler:
 
                 if self._paused:
                     _log.info("CRAWLER PAUSED at index %d (%s)", i, symbols[i])
+                    # Natural break point: flush rankings before waiting so
+                    # the UI shows up-to-date ranks during the pause.
+                    if symbols_since_last_ranking > 0:
+                        try:
+                            rk_t0 = time.time()
+                            await _update_rankings()
+                            _log.info(
+                                "CRAWLER: Rankings flushed on pause (%d symbols, %.2fs)",
+                                symbols_since_last_ranking, time.time() - rk_t0,
+                            )
+                            symbols_since_last_ranking = 0
+                        except Exception as exc:
+                            _log.warning("Pause rankings flush failed: %s", exc)
                     _save_state(self._build_state(
                         symbols, i - 1, "paused",
                         current_cycle, evaluated, failed,
@@ -348,17 +362,19 @@ class Crawler:
                     current_cycle, evaluated, failed,
                 ))
 
-                # Periodic rankings refresh — amortizes the ~15s/symbol
-                # cost of the full re-sort over many symbols while keeping
-                # rankings fresh enough for the UI during multi-hour crawls.
-                if (i + 1) % RANKINGS_UPDATE_INTERVAL == 0:
+                # Periodic rankings refresh. SQL is now a single window
+                # function (~0.5s), so every 50 symbols is cheap while
+                # keeping the leaderboard fresh.
+                symbols_since_last_ranking += 1
+                if symbols_since_last_ranking >= rankings_interval:
                     try:
                         rk_t0 = time.time()
                         await _update_rankings()
                         _log.info(
-                            "CRAWLER: Rankings updated at symbol %d/%d (%.1fs)",
-                            i + 1, total, time.time() - rk_t0,
+                            "CRAWLER: Rankings updated at symbol %d/%d (%.2fs, interval=%d)",
+                            i + 1, total, time.time() - rk_t0, rankings_interval,
                         )
+                        symbols_since_last_ranking = 0
                     except Exception as exc:
                         _log.warning("Periodic rankings update failed: %s", exc)
 
@@ -376,17 +392,17 @@ class Crawler:
             )
             _log.info("=" * 60)
 
-            # Final rankings refresh at end of cycle — guarantees the
-            # leaderboard reflects every symbol evaluated in this cycle,
-            # even the last (RANKINGS_UPDATE_INTERVAL - 1) ones that did
-            # not trigger the periodic refresh.
+            # Natural break point: end-of-cycle. Flush rankings so the
+            # leaderboard reflects every symbol from this cycle before we
+            # sleep between cycles.
             try:
                 rk_t0 = time.time()
                 await _update_rankings()
-                _log.info("CRAWLER: Final rankings update after cycle %d (%.1fs)",
+                _log.info("CRAWLER: End-of-cycle rankings flush after cycle %d (%.2fs)",
                           current_cycle, time.time() - rk_t0)
+                symbols_since_last_ranking = 0
             except Exception as exc:
-                _log.warning("Final rankings update failed: %s", exc)
+                _log.warning("End-of-cycle rankings flush failed: %s", exc)
 
             self._last_cycle_completed_at = datetime.now(timezone.utc).isoformat()
 

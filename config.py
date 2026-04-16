@@ -89,6 +89,7 @@ class Settings(BaseSettings):
     # Refresh cycle
     refresh_period_days: int = 7
     pause_between_symbols_sec: float = 2.0
+    rankings_update_interval: int = 50
     
     @model_validator(mode="after")
     def _resolve_db_path(self):
