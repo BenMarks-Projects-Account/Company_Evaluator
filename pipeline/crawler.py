@@ -262,8 +262,14 @@ class Crawler:
                 current_cycle, 0, 0,
             ))
 
-            # ── Inner loop: one symbol at a time ─────────────────
-            for i in range(current_start, total):
+            # ── Inner loop: process symbols in batches of N ──────
+            # ``llm_concurrent_symbols`` controls how many symbols the
+            # crawler works on concurrently (default 2, matching the two
+            # LM Studio endpoints). Each symbol's LLM call routes to a
+            # different endpoint via the router's least-busy selector.
+            concurrent_n = max(1, getattr(settings, "llm_concurrent_symbols", 2))
+            i = current_start
+            while i < total:
                 if not self._running:
                     _log.info("CRAWLER STOPPED at %d/%d (user requested)", i, total)
                     _save_state(self._build_state(
@@ -296,60 +302,74 @@ class Crawler:
                         break
                     _log.info("CRAWLER RESUMED at index %d (%s)", i, symbols[i])
 
-                symbol = symbols[i]
-                self._current_symbol = symbol
+                batch_end = min(i + concurrent_n, total)
+                batch = [(j, symbols[j]) for j in range(i, batch_end)]
+                batch_label = ", ".join(s for _, s in batch)
+                self._current_symbol = batch[0][1] if len(batch) == 1 else batch_label
 
                 _log.info("-" * 40)
-                _log.info("CRAWLER [%d/%d]: Starting %s", i + 1, total, symbol)
+                _log.info(
+                    "CRAWLER [%d-%d/%d]: Starting batch %s",
+                    i + 1, batch_end, total, batch_label,
+                )
 
-                eval_start = time.time()
-                try:
-                    result = await evaluate_company(symbol, skip_rankings=True)
+                batch_start = time.time()
+                results = await asyncio.gather(
+                    *(evaluate_company(sym, skip_rankings=True) for _, sym in batch),
+                    return_exceptions=True,
+                )
+                batch_elapsed = time.time() - batch_start
 
-                    if result.get("status") == "complete":
+                # Per-symbol bookkeeping after the batch completes.
+                for (idx, sym), result in zip(batch, results):
+                    if isinstance(result, Exception):
+                        failed += 1
+                        _log.error(
+                            "CRAWLER [%d/%d]: %s EXCEPTION — %s",
+                            idx + 1, total, sym, result, exc_info=result,
+                        )
+                        self._record_activity(sym, "error", error=str(result))
+                    elif result.get("status") == "complete":
                         evaluated += 1
-                        eval_sec = time.time() - eval_start
+                        # Per-symbol wall time is unavailable under gather;
+                        # use batch_elapsed/len(batch) as a fair approximation
+                        # so eval_times averages remain meaningful.
+                        eval_sec = batch_elapsed / len(batch)
                         self._eval_times.append(eval_sec)
                         if len(self._eval_times) > 50:
                             self._eval_times = self._eval_times[-50:]
                         score = result.get("composite_score") or 0
                         rec = result.get("llm_recommendation")
                         _log.info(
-                            "CRAWLER [%d/%d]: %s COMPLETE — score=%.1f quality=%s (%.0fs)",
-                            i + 1, total, symbol, score,
-                            result.get("data_quality", "?"), eval_sec,
+                            "CRAWLER [%d/%d]: %s COMPLETE — score=%.1f quality=%s (~%.0fs, batch=%.0fs)",
+                            idx + 1, total, sym, score,
+                            result.get("data_quality", "?"), eval_sec, batch_elapsed,
                         )
-                        self._record_activity(symbol, "success", score=score, recommendation=rec)
+                        self._record_activity(sym, "success", score=score, recommendation=rec)
                     else:
                         failed += 1
                         err_msg = result.get("error", f"status={result.get('status')}")
                         _log.warning(
                             "CRAWLER [%d/%d]: %s FAILED — status=%s",
-                            i + 1, total, symbol, result.get("status"),
+                            idx + 1, total, sym, result.get("status"),
                         )
-                        self._record_activity(symbol, "error", error=err_msg)
-                except Exception as exc:
-                    failed += 1
-                    _log.error(
-                        "CRAWLER [%d/%d]: %s EXCEPTION — %s",
-                        i + 1, total, symbol, exc, exc_info=True,
-                    )
-                    self._record_activity(symbol, "error", error=str(exc))
+                        self._record_activity(sym, "error", error=err_msg)
 
-                # Phase 2c: count every completed symbol attempt (success or fail)
-                if self._orchestrator is not None:
-                    try:
-                        self._orchestrator.record_symbol_processed()
-                    except Exception:
-                        pass
+                    # Phase 2c: count every completed symbol attempt.
+                    if self._orchestrator is not None:
+                        try:
+                            self._orchestrator.record_symbol_processed()
+                        except Exception:
+                            pass
 
+                last_idx = batch_end - 1
                 self._progress = {
                     "total": total,
                     "evaluated": evaluated,
                     "failed": failed,
-                    "current_index": i + 1,
-                    "remaining": total - i - 1,
-                    "pct": round(((i + 1) / total) * 100, 1),
+                    "current_index": last_idx + 1,
+                    "remaining": total - last_idx - 1,
+                    "pct": round(((last_idx + 1) / total) * 100, 1),
                 }
                 _log.info(
                     "CRAWLER PROGRESS: Cycle %d — %.1f%% — %d evaluated, %d failed, %d remaining",
@@ -358,27 +378,35 @@ class Crawler:
                 )
 
                 _save_state(self._build_state(
-                    symbols, i, "running",
+                    symbols, last_idx, "running",
                     current_cycle, evaluated, failed,
                 ))
 
-                # Periodic rankings refresh. SQL is now a single window
-                # function (~0.5s), so every 50 symbols is cheap while
-                # keeping the leaderboard fresh.
-                symbols_since_last_ranking += 1
+                # Periodic rankings refresh — tied to total symbols
+                # processed (not batches), so interval semantics stay
+                # consistent regardless of concurrent_n.
+                symbols_since_last_ranking += len(batch)
                 if symbols_since_last_ranking >= rankings_interval:
                     try:
                         rk_t0 = time.time()
                         await _update_rankings()
                         _log.info(
                             "CRAWLER: Rankings updated at symbol %d/%d (%.2fs, interval=%d)",
-                            i + 1, total, time.time() - rk_t0, rankings_interval,
+                            last_idx + 1, total, time.time() - rk_t0, rankings_interval,
                         )
                         symbols_since_last_ranking = 0
                     except Exception as exc:
                         _log.warning("Periodic rankings update failed: %s", exc)
 
+                # Piggyback LLM router health check on the rankings cadence.
+                try:
+                    from analysis.llm_router import get_router
+                    await get_router().health_check()
+                except Exception:
+                    pass
+
                 await asyncio.sleep(pause_sec)
+                i = batch_end
 
             # ── End of inner loop ────────────────────────────────
             if not self._running:

@@ -55,6 +55,14 @@ class Settings(BaseSettings):
     llm_model: str = ""  # empty = auto-detect from LM Studio
     llm_timeout: int = 120
     llm_temperature: float = 0.0
+
+    # LLM routing (Tier 2) — distribute calls across two LM Studio
+    # instances. URLs are base URLs (without /v1/...); router appends
+    # the standard OpenAI-compatible paths.
+    llm_routing_enabled: bool = True
+    llm_local_url: str = "http://localhost:1234"
+    llm_model_machine_url: str = "http://192.168.1.143:1234"
+    llm_concurrent_symbols: int = 2
     
     # Data Sources
     polygon_api_key: str = ""

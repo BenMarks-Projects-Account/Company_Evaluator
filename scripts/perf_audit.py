@@ -5,7 +5,12 @@ crawler stopped. Uses zero-change monkey patches on `httpx.AsyncClient`
 to time every outbound HTTP call (Polygon / Finnhub / FMP / LM Studio)
 and on `asyncio.sleep` to measure total rate-limit backoff per symbol.
 
-Outputs a per-symbol breakdown + aggregate host/phase report.
+After Tier 2 (LLM routing) the audit processes symbols in concurrent
+batches of N=settings.llm_concurrent_symbols so the two LM Studio
+endpoints are actually exercised.
+
+Outputs a per-symbol breakdown + aggregate host/phase report +
+LLM router stats.
 
 Usage:
     .\\.venv\\Scripts\\python.exe scripts\\perf_audit.py
@@ -13,6 +18,7 @@ Usage:
 from __future__ import annotations
 
 import asyncio
+import contextvars
 import logging
 import sys
 import time
@@ -26,7 +32,16 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 import httpx  # noqa: E402
 
 _HTTP_CALLS: list[dict] = []
-_CURRENT_SYMBOL: str = "?"
+# Per-task symbol binding so concurrent evaluate_company() calls under
+# asyncio.gather attribute their HTTP/LLM/sleep samples to the right symbol.
+_CURRENT_SYMBOL_CV: contextvars.ContextVar[str] = contextvars.ContextVar(
+    "perf_audit_current_symbol", default="?"
+)
+
+
+def _cur_sym() -> str:
+    return _CURRENT_SYMBOL_CV.get()
+
 
 _orig_send = httpx.AsyncClient.send
 
@@ -36,10 +51,10 @@ async def _timed_send(self, request, *args, **kwargs):
     try:
         resp = await _orig_send(self, request, *args, **kwargs)
         status = resp.status_code
-        size = len(resp.content) if resp.content else 0
+        size = int(resp.headers.get("content-length") or 0)
     except Exception as exc:  # pragma: no cover
         _HTTP_CALLS.append({
-            "symbol": _CURRENT_SYMBOL,
+            "symbol": _cur_sym(),
             "host": urlparse(str(request.url)).hostname or "?",
             "path": urlparse(str(request.url)).path,
             "method": request.method,
@@ -50,7 +65,7 @@ async def _timed_send(self, request, *args, **kwargs):
         })
         raise
     _HTTP_CALLS.append({
-        "symbol": _CURRENT_SYMBOL,
+        "symbol": _cur_sym(),
         "host": urlparse(str(request.url)).hostname or "?",
         "path": urlparse(str(request.url)).path,
         "method": request.method,
@@ -62,7 +77,8 @@ async def _timed_send(self, request, *args, **kwargs):
     return resp
 
 
-httpx.AsyncClient.send = _timed_send
+httpx.AsyncClient.send = _timed_send  # type: ignore[assignment]
+
 
 # ── Monkey-patch asyncio.sleep to measure rate-limit waits ──────────
 _SLEEP_TOTAL: defaultdict[str, float] = defaultdict(float)
@@ -71,20 +87,19 @@ _orig_sleep = asyncio.sleep
 
 async def _timed_sleep(delay, *args, **kwargs):
     if delay and delay > 0:
-        _SLEEP_TOTAL[_CURRENT_SYMBOL] += float(delay)
+        _SLEEP_TOTAL[_cur_sym()] += float(delay)
     return await _orig_sleep(delay, *args, **kwargs)
 
 
 asyncio.sleep = _timed_sleep  # type: ignore[assignment]
 
-# ── Logging setup: capture evaluator log lines too ───────────────────
+# ── Logging setup ────────────────────────────────────────────────────
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s %(levelname)s %(name)s: %(message)s",
 )
 logger = logging.getLogger("perf_audit")
 
-# Silence the very chatty loggers to keep the output readable
 for noisy in ("httpx", "bulk.bulk_fetcher", "bulk.bulk_parser"):
     logging.getLogger(noisy).setLevel(logging.WARNING)
 
@@ -95,7 +110,7 @@ from pipeline.evaluator import evaluate_company  # noqa: E402
 from analysis.llm_client import call_llm as _orig_call_llm  # noqa: E402
 import analysis.llm_client as _llm_module  # noqa: E402
 
-# Instrument the LLM call to capture prompt/response sizes + exact time.
+# Instrument the LLM wrapper to capture prompt/response sizes + exact time.
 _LLM_CALLS: list[dict] = []
 
 
@@ -104,7 +119,7 @@ async def _timed_call_llm(system_prompt: str, user_prompt: str, max_tokens: int 
     result = await _orig_call_llm(system_prompt, user_prompt, max_tokens)
     elapsed = time.time() - t
     _LLM_CALLS.append({
-        "symbol": _CURRENT_SYMBOL,
+        "symbol": _cur_sym(),
         "prompt_chars": len(system_prompt) + len(user_prompt),
         "response_chars": len(result) if result else 0,
         "elapsed": elapsed,
@@ -132,38 +147,48 @@ def _classify_host(host: str) -> str:
         return "finnhub"
     if "financialmodelingprep" in h or "fmp" in h:
         return "fmp"
-    if "localhost" in h or "127.0.0.1" in h or "1234" in h:
-        return "llm"
-    if "yahoo" in h or "yfapi" in h or "yahooapis" in h:
-        return "yahoo"
-    return h or "other"
+    if "localhost" in h or "127.0.0.1" in h or "192.168.1.143" in h:
+        return "lmstudio"
+    return h or "unknown"
+
+
+async def _evaluate_one(sym: str) -> dict:
+    """Evaluate a single symbol with its own contextvar binding."""
+    _CURRENT_SYMBOL_CV.set(sym)
+    logger.info("\n%s\n>>> %s\n%s", "=" * 60, sym, "=" * 60)
+    t0 = time.time()
+    ok = True
+    try:
+        result = await evaluate_company(sym, skip_rankings=True)
+        status = result.get("status")
+        if status != "complete":
+            ok = False
+            logger.warning("%s: status=%s", sym, status)
+    except Exception as exc:
+        ok = False
+        logger.error("%s: EXCEPTION %s", sym, exc, exc_info=True)
+    return {"symbol": sym, "elapsed": time.time() - t0, "ok": ok}
 
 
 async def main():
-    global _CURRENT_SYMBOL
     settings = get_settings()
     await init_db(settings.database_url)
-    logger.info("Perf audit starting — %d symbols", len(TEST_SYMBOLS))
+    concurrent_n = max(1, getattr(settings, "llm_concurrent_symbols", 2))
+    logger.info(
+        "Perf audit starting — %d symbols, concurrent=%d",
+        len(TEST_SYMBOLS), concurrent_n,
+    )
 
     per_symbol: list[dict] = []
-    for sym in TEST_SYMBOLS:
-        _CURRENT_SYMBOL = sym
-        logger.info("\n%s\n>>> %s\n%s", "=" * 60, sym, "=" * 60)
-        t0 = time.time()
-        ok = True
-        try:
-            # Mimic the crawler path: rankings are deferred to end-of-batch
-            # so per-symbol timings reflect the production crawl.
-            result = await evaluate_company(sym, skip_rankings=True)
-            status = result.get("status")
-            if status != "complete":
-                ok = False
-                logger.warning("%s: status=%s", sym, status)
-        except Exception as exc:
-            ok = False
-            logger.error("%s: EXCEPTION %s", sym, exc, exc_info=True)
-        total = time.time() - t0
-        per_symbol.append({"symbol": sym, "elapsed": total, "ok": ok})
+    wall_start = time.time()
+    for i in range(0, len(TEST_SYMBOLS), concurrent_n):
+        batch = TEST_SYMBOLS[i : i + concurrent_n]
+        results = await asyncio.gather(
+            *(_evaluate_one(s) for s in batch),
+            return_exceptions=False,
+        )
+        per_symbol.extend(results)
+    wall_elapsed = time.time() - wall_start
 
     # End-of-batch rankings flush (matches crawler behavior)
     try:
@@ -174,7 +199,7 @@ async def main():
     except Exception as exc:
         logger.warning("End-of-batch rankings update failed: %s", exc)
 
-    _CURRENT_SYMBOL = "(done)"
+    _CURRENT_SYMBOL_CV.set("(done)")
 
     # ── Aggregate ────────────────────────────────────────────────
     print("\n" + "=" * 78)
@@ -195,7 +220,28 @@ async def main():
               f"{http_count:>7d}")
 
     avg = total_all / len(per_symbol) if per_symbol else 0
-    print(f"\nAverage total/symbol: {avg:.1f}s  —  total audit: {total_all:.1f}s")
+    print(f"\nAverage total/symbol: {avg:.1f}s (sum of per-symbol wall times)")
+    print(f"WALL CLOCK total: {wall_elapsed:.1f}s (concurrent={concurrent_n})")
+    if per_symbol:
+        print(f"Effective per-symbol (wall / N): {wall_elapsed / len(per_symbol):.1f}s")
+
+    # ── LLM routing stats ────────────────────────────────────────
+    try:
+        from analysis.llm_router import get_router
+        router_stats = get_router().get_stats()
+        print("\n" + "=" * 78)
+        print("LLM ROUTING STATS")
+        print("=" * 78)
+        for e in router_stats["endpoints"]:
+            print(
+                f"  {e['name']:<15} calls={e['total_calls']:>3} "
+                f"errs={e['total_errors']:>2} "
+                f"avg={e['avg_latency_s']:>5.1f}s healthy={e['healthy']}"
+            )
+        print(f"  total_calls={router_stats['total_calls']} "
+              f"healthy_endpoints={router_stats['healthy_endpoints']}")
+    except Exception as exc:
+        logger.warning("Could not fetch router stats: %s", exc)
 
     # ── Host breakdown ───────────────────────────────────────────
     host_stats: dict[str, dict] = defaultdict(
