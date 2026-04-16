@@ -9,7 +9,7 @@ Code tag: `pre-backtest-phase-a-dirty`
 - ✅ **No redundant pillar pair** (Analysis 1): max |Pearson r| = 0.58 < 0.7 between any two pillar scores.
 - ✅ **Multi-factor framework retained** (Analysis 3): PC1 = 47.7% < 50% — pillars genuinely capture distinct dimensions rather than collapsing to a single axis.
 - ✅ **Composite distribution is well-shaped** (Analysis 5): skew=0.04, excess kurtosis=-0.31 — symmetric and platykurtic, clean discrimination across the universe.
-- ⚠️ **P2 sub-metric coverage (scoring-layer bug).** `debt_to_ebitda` and `sga_efficiency` fall below 50% coverage because sentinel values like `no_debt` and `routine_selling` are string-typed and get coerced to NaN. Recommendation: map these sentinels to neutral or favorable numeric scores at metric computation time instead of emitting strings. This distorts Analysis 2's within-pillar correlation view for P2.
+- ⚠️ **P2 sub-metric coverage (data-provider gap).** `debt_to_ebitda` and `sga_efficiency` fall below 50% coverage primarily because Polygon does not populate `long_term_debt` and `selling_general_administrative` for many financials, REITs, and utilities — not because of sentinel coercion. The only string sentinel in P2 is `no_debt` on `interest_coverage`, which is already mapped to score=100 in the scoring layer. (The `routine_selling` sentinel lives in P3's smart-money analyzer and the breakout logic; it does not touch P2.) Full normalization details are in `docs/P2_NORMALIZATION_REFERENCE.md`.
 
 ## 1. Pillar correlation matrix
 **Interpretation:** Pairwise Pearson correlations between the 5 pillar scores run at mean |r|=0.34 with max |r|=0.58. Low-to-moderate correlation is healthy: it means pillars capture different dimensions of quality. Values above 0.7 would indicate redundancy; values near 0 mean independence.
@@ -605,7 +605,7 @@ Code tag: `pre-backtest-phase-a-dirty`
 | 0.2.0 | 2125.000 | 100.000 |
 
 ## Framework Concerns
-- **P2 sub-metric coverage (scoring-layer bug).** `debt_to_ebitda` and `sga_efficiency` fall below 50% coverage because sentinel values like `no_debt` and `routine_selling` are string-typed and get coerced to NaN. Recommendation: map these sentinels to neutral or favorable numeric scores at metric computation time instead of emitting strings. This distorts Analysis 2's within-pillar correlation view for P2.
+- **P2 sub-metric coverage (data-provider gap).** `debt_to_ebitda` and `sga_efficiency` fall below 50% coverage primarily because Polygon does not populate `long_term_debt` and `selling_general_administrative` for many financials, REITs, and utilities — not because of sentinel coercion. The only string sentinel in P2 is `no_debt` on `interest_coverage`, which is already mapped to score=100 in the scoring layer. (The `routine_selling` sentinel lives in P3's smart-money analyzer and the breakout logic; it does not touch P2.) Full normalization details are in `docs/P2_NORMALIZATION_REFERENCE.md`.
 
 ## Framework Strengths
 - **No redundant pillar pair** (Analysis 1): max |Pearson r| = 0.58 < 0.7 between any two pillar scores.

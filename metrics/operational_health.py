@@ -58,6 +58,17 @@ def compute(data: dict) -> dict:
     profile = data.get("profile") or {}
 
     # --- SG&A Efficiency ---
+    # Measures:     Selling, general, and administrative expense as a share
+    #               of revenue (lower = more operationally efficient).
+    # Inputs:       TTM sum of selling_general_administrative (Polygon
+    #               quarterly); TTM revenue (Polygon); Finnhub sgaToSaleTTM
+    #               as fallback (divided by 100 when expressed as a percent).
+    # Sentinel:     None — genuine missing data stays missing.
+    # Normalization: 0.05 (5%) → 100, 0.40 (40%) → 0 (linear, inverted).
+    # Direction:    lower is better.
+    # Limitation:   Coverage drops to ~44% because financials, REITs, and
+    #               utilities typically do not disclose SG&A as a separate
+    #               line. Not addressed in this cleanup.
     sga_ttm = ttm_sum(quarterly, "selling_general_administrative")
     rev_ttm = ttm_sum(quarterly, "revenue")
     sga_eff = safe_div(sga_ttm, rev_ttm)
@@ -66,6 +77,19 @@ def compute(data: dict) -> dict:
         sga_eff = v / 100 if (v is not None and v > 1) else v  # Finnhub stores as ratio < 1
 
     # --- Debt / EBITDA ---
+    # Measures:     Total long-term debt divided by operating income (used as
+    #               EBIT proxy; we lack a clean D&A line). Lower = less levered.
+    # Inputs:       latest(long_term_debt) (Polygon); operating_income TTM
+    #               (Polygon). Fallback derives EBITDA from Finnhub
+    #               evEbitdaTTM × market_cap.
+    # Sentinel:     None — see limitation. A parallel "no_debt" sentinel was
+    #               evaluated and rejected during the p2-cleanup because
+    #               Polygon's long_term_debt=None frequently coincides with
+    #               real debt reported by Finnhub (10/10 spot-check failed).
+    # Normalization: 0.0 → 100, 5.0× → 0 (linear, inverted).
+    # Direction:    lower is better.
+    # Limitation:   Coverage ~45%; the long_term_debt field is sparsely
+    #               populated by Polygon for financials, REITs, utilities.
     # Approximate EBITDA ≈ operating_income (we lack D&A separately)
     # Use Finnhub's totalDebt/totalEquity and ebitdPerShareTTM for a better proxy
     op_inc_ttm = ttm_sum(quarterly, "operating_income")
@@ -86,25 +110,52 @@ def compute(data: dict) -> dict:
             debt_ebitda = safe_div(total_debt, ebitda_approx)
 
     # --- Interest Coverage ---
-    # Compute from statements first (operating_income / interest_expense)
-    interest_exp = abs(ttm_sum(quarterly, "interest_expense") or 0)
-    NO_DEBT_THRESHOLD = 1_000_000  # $1M — below this, treat as essentially no debt
-    if op_inc_ttm is not None and interest_exp >= NO_DEBT_THRESHOLD and op_inc_ttm > 0:
+    # Measures:     Operating income / interest expense (higher = safer).
+    # Inputs:       operating_income TTM (Polygon quarterly statements);
+    #               interest_expense TTM (Polygon); Finnhub
+    #               netInterestCoverageTTM as fallback.
+    # Sentinel:     "no_debt" when interest_expense is *reported* and its
+    #               magnitude is below NO_DEBT_THRESHOLD ($1M). Distinct from
+    #               interest_expense being *missing* (None), which now falls
+    #               through to the Finnhub fallback without triggering the
+    #               sentinel. Sentinel maps to score 100 in rescore.
+    # Normalization: 2× → 0, 20× → 100 (linear; see _BOUNDS).
+    # Direction:    higher is better.
+    #
+    # Post-p2-cleanup: the prior code did `abs(ttm_sum(...) or 0)` which
+    # collapsed "None" into "0", falsely tripping the no_debt sentinel on any
+    # company where Polygon simply hadn't populated interest_expense. We now
+    # distinguish missing vs. reported-but-small so Finnhub gets a chance.
+    interest_exp_ttm = ttm_sum(quarterly, "interest_expense")
+    interest_exp = abs(interest_exp_ttm) if interest_exp_ttm is not None else None
+    NO_DEBT_THRESHOLD = 1_000_000  # $1M — below this (when reported), treat as essentially no debt
+    if interest_exp is None:
+        # interest_expense not reported by Polygon — fall back to Finnhub.
+        interest_cov = fh.get("netInterestCoverageTTM")
+        # Finnhub returns 0 for companies with effectively no interest expense.
+        # Without a Polygon number to corroborate we cannot confidently emit
+        # the "no_debt" sentinel; leave as numeric 0 → scores low. This is
+        # conservative but honest.
+    elif op_inc_ttm is not None and interest_exp >= NO_DEBT_THRESHOLD and op_inc_ttm > 0:
         interest_cov = op_inc_ttm / interest_exp
     elif op_inc_ttm is not None and interest_exp < NO_DEBT_THRESHOLD:
         interest_cov = "no_debt"
     else:
-        # Finnhub fallback
+        # op_inc_ttm missing or non-positive — Finnhub fallback.
         interest_cov = fh.get("netInterestCoverageTTM")
-        if interest_cov is not None and interest_cov == 0:
-            # Finnhub returns 0 for low-debt companies — check if it's really no debt
-            if interest_exp < NO_DEBT_THRESHOLD:
-                interest_cov = "no_debt"
+        if interest_cov is not None and interest_cov == 0 and interest_exp < NO_DEBT_THRESHOLD:
+            interest_cov = "no_debt"
     # Cap extreme numeric values for scoring stability
     if isinstance(interest_cov, (int, float)) and interest_cov is not None:
         interest_cov = min(interest_cov, 100.0)
 
     # --- Current Ratio ---
+    # Measures:     Current assets / current liabilities (short-term liquidity).
+    # Inputs:       latest(current_assets), latest(current_liabilities)
+    #               (Polygon); Finnhub currentRatioQuarterly fallback.
+    # Sentinel:     None.
+    # Normalization: 0.8 → 0, 2.5 → 100 (linear).
+    # Direction:    higher is better.
     ca = latest(quarterly, "current_assets")
     cl = latest(quarterly, "current_liabilities")
     current_ratio = safe_div(ca, cl)
@@ -112,11 +163,34 @@ def compute(data: dict) -> dict:
         current_ratio = fh.get("currentRatioQuarterly")
 
     # --- Cash Conversion (OCF / Net Income) ---
+    # Measures:     How much of reported earnings shows up as cash flow.
+    # Inputs:       TTM operating_cash_flow, TTM net_income (Polygon).
+    # Sentinel:     None — gated by net_income > 0 to avoid divide-by-negative
+    #               producing misleading ratios.
+    # Normalization: 0.5 → 0, 1.5 → 100 (linear).
+    # Direction:    higher is better.
+    # Limitation:   Structurally penalizes banks because net income is
+    #               accrual-based and operating cash flow for banks includes
+    #               loan book flows that swamp NI. Not addressed in cleanup.
     ocf_ttm = ttm_sum(quarterly, "operating_cash_flow")
     ni_ttm = ttm_sum(quarterly, "net_income")
     cash_conv = safe_div(ocf_ttm, ni_ttm) if (ni_ttm and ni_ttm > 0) else None
 
     # --- Altman Z (simplified manufacturing formula adapted) ---
+    # Measures:     Composite distress indicator; higher = further from
+    #               bankruptcy. Uses the classic 5-factor Altman coefficients.
+    # Inputs:       current_assets, current_liabilities, total_assets,
+    #               total_liabilities, operating_income TTM, revenue TTM,
+    #               market_cap (from profile). "Retained earnings" is
+    #               approximated by (total_assets - total_liabilities) since
+    #               Polygon doesn't break RE out separately.
+    # Sentinel:     None.
+    # Normalization: 1.8 → 0 (distress edge), 4.0 → 100 (safe); cash-rich
+    #               outliers (e.g. NVDA Z≈72) saturate at 100.
+    # Direction:    higher is better.
+    # Post-p2-cleanup: validation upper bound in metrics/validation.py was
+    # raised from 20 → 100 so that realistic high-Z values are not clipped
+    # to None by the validator. Scoring ceiling at Z=4.0 is unchanged.
     # Z = 1.2*WC/TA + 1.4*RE/TA + 3.3*EBIT/TA + 0.6*MktCap/TL + 1.0*Rev/TA
     ta = latest(quarterly, "total_assets")
     tl = latest(quarterly, "total_liabilities")

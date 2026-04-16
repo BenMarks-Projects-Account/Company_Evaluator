@@ -163,11 +163,14 @@ async def _amain(partial: bool) -> None:
 
     # Standing concerns from the audit design
     concerns.append(
-        "**P2 sub-metric coverage (scoring-layer bug).** `debt_to_ebitda` and `sga_efficiency` "
-        "fall below 50% coverage because sentinel values like `no_debt` and `routine_selling` "
-        "are string-typed and get coerced to NaN. Recommendation: map these sentinels to neutral "
-        "or favorable numeric scores at metric computation time instead of emitting strings. "
-        "This distorts Analysis 2's within-pillar correlation view for P2."
+        "**P2 sub-metric coverage (data-provider gap).** `debt_to_ebitda` and `sga_efficiency` "
+        "fall below 50% coverage primarily because Polygon does not populate `long_term_debt` "
+        "and `selling_general_administrative` for many financials, REITs, and utilities — not "
+        "because of sentinel coercion. The only string sentinel in P2 is `no_debt` on "
+        "`interest_coverage`, which is already mapped to score=100 in the scoring layer. "
+        "(The `routine_selling` sentinel lives in P3's smart-money analyzer and the breakout "
+        "logic; it does not touch P2.) Full normalization details are in "
+        "`docs/P2_NORMALIZATION_REFERENCE.md`."
     )
 
     # Pull per-analysis flags

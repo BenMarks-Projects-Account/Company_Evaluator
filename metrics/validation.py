@@ -20,7 +20,12 @@ METRIC_BOUNDS = {
     "interest_coverage": (-100.0, 1000.0, "Interest coverage"),
     "current_ratio": (0.0, 50.0, "Current ratio"),
     "cash_conversion": (-10.0, 10.0, "OCF / Net Income"),
-    "altman_z": (-10.0, 20.0, "Altman Z score"),
+    # altman_z upper bound raised from 20 → 100 (post-p2-cleanup): cash-rich
+    # tech names (e.g. NVDA Z≈72) were being clipped to None because the prior
+    # bound was below their true Z. The P2 operational_health scoring function
+    # maps Z ≥ 4.0 to 100 regardless, so the widened validation bound just
+    # lets realistic top-end values survive validation instead of being nulled.
+    "altman_z": (-10.0, 100.0, "Altman Z score"),
 
     # Capital Allocation
     "roic_wacc_spread": (-1.0, 1.0, "ROIC - WACC spread"),
