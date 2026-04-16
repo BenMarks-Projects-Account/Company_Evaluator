@@ -185,6 +185,26 @@ class OnDemandJob(Base):
     result_json = Column(Text)  # JSON of full result payload
 
 
+class CrawlerCycleMetric(Base):
+    """Per-cycle crawler performance + bulk cache metrics (Phase 2c)."""
+    __tablename__ = "crawler_cycle_metrics"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    cycle_started_at = Column(String(50), nullable=False)
+    cycle_duration_seconds = Column(Float)
+    symbols_processed = Column(Integer)
+    avg_seconds_per_symbol = Column(Float)
+    cache_hits = Column(Integer)
+    cache_misses = Column(Integer)
+    hit_rate = Column(Float)
+    cache_was_stale = Column(Boolean)
+    refresh_attempted = Column(Boolean)
+    refresh_succeeded = Column(Boolean)
+    refresh_duration_seconds = Column(Float)
+    refresh_error = Column(Text)
+    created_at = Column(DateTime, default=lambda: datetime.now(timezone.utc))
+
+
 # Engine and session
 _engine = None
 _session_factory = None

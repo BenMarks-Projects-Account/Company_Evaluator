@@ -70,6 +70,9 @@ class Settings(BaseSettings):
     fmp_rate_limit_per_min: int = 300 # Paid tier: 300 req/min
     fmp_base_url: str = "https://financialmodelingprep.com/stable"
     enable_bulk_cache: bool = True    # Wrap FMPClient with CachedFMPClient when bulk DB exists
+    bulk_cache_path: str = ""         # Override bulk cache DB path (empty = default alongside main DB)
+    bulk_cache_stale_hours: int = 24  # Crawler-triggered refresh threshold
+    bulk_auto_refresh: bool = True    # Auto-refresh stale cache at cycle start (Phase 2c)
 
     # Data source routing — per-call-site overrides for Polygon→FMP migration.
     # JSON string mapping call-site keys to "polygon", "fmp", or "shadow".

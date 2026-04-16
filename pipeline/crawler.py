@@ -85,6 +85,29 @@ class Crawler:
         self._recent_activity: list[dict] = []
         self._last_error: dict | None = None
         self._eval_times: list[float] = []
+        self._orchestrator = None
+        self._before_summary: dict | None = None
+
+    def _get_orchestrator(self):
+        """Lazily build the CycleOrchestrator, reusing the evaluator's FMP client."""
+        if self._orchestrator is not None:
+            return self._orchestrator
+        try:
+            from bulk.cycle_orchestrator import CycleOrchestrator
+            from pipeline.evaluator import _get_fmp_client
+            settings = get_settings()
+            # Trigger FMP client init so get_cache_stats works even if no symbol
+            # has been evaluated yet in this process.
+            fmp_client = _get_fmp_client()
+            self._orchestrator = CycleOrchestrator(
+                settings=settings,
+                cached_fmp_client=fmp_client,
+            )
+            self._orchestrator.log_startup_state()
+        except Exception as exc:
+            _log.warning("Could not initialize CycleOrchestrator: %s", exc)
+            self._orchestrator = None
+        return self._orchestrator
 
     def _record_activity(self, symbol: str, status: str, score=None, recommendation=None, error=None):
         entry = {
@@ -214,6 +237,19 @@ class Crawler:
                 )
                 _log.info("=" * 60)
 
+            # Phase 2c: check bulk cache staleness + reset per-cycle stats.
+            # Only run at the TOP of a full cycle (index 0), not on resume.
+            self._before_summary = None
+            if current_start == 0:
+                orch = self._get_orchestrator()
+                if orch is not None:
+                    try:
+                        # Run blocking refresh off the event loop so it does not
+                        # starve other coroutines while downloading ~11 min of data.
+                        self._before_summary = await asyncio.to_thread(orch.before_cycle)
+                    except Exception as exc:
+                        _log.warning("before_cycle hook failed: %s", exc)
+
             _save_state(self._build_state(
                 symbols, current_start - 1, "running",
                 current_cycle, 0, 0,
@@ -280,6 +316,13 @@ class Crawler:
                     )
                     self._record_activity(symbol, "error", error=str(exc))
 
+                # Phase 2c: count every completed symbol attempt (success or fail)
+                if self._orchestrator is not None:
+                    try:
+                        self._orchestrator.record_symbol_processed()
+                    except Exception:
+                        pass
+
                 self._progress = {
                     "total": total,
                     "evaluated": evaluated,
@@ -314,6 +357,16 @@ class Crawler:
             _log.info("=" * 60)
 
             self._last_cycle_completed_at = datetime.now(timezone.utc).isoformat()
+
+            # Phase 2c: log per-cycle cache stats and persist metrics
+            if self._orchestrator is not None:
+                try:
+                    after_summary = self._orchestrator.after_cycle()
+                    self._orchestrator.persist_cycle_summary(
+                        self._before_summary or {}, after_summary or {},
+                    )
+                except Exception as exc:
+                    _log.warning("after_cycle hook failed: %s", exc)
 
             # Prepare next cycle — reload from DB with fresh ordering
             current_cycle += 1
