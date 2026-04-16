@@ -61,7 +61,7 @@ class Settings(BaseSettings):
     # the standard OpenAI-compatible paths.
     llm_routing_enabled: bool = True
     llm_local_url: str = "http://localhost:1234"
-    llm_model_machine_url: str = "http://192.168.1.143:1234"
+    llm_model_machine_url: str = "http://192.168.1.89:1234"
     llm_concurrent_symbols: int = 2
     
     # Data Sources

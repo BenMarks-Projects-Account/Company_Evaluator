@@ -87,7 +87,7 @@ class LLMRouter:
         routing_enabled = getattr(self.settings, "llm_routing_enabled", True)
         local_url = getattr(self.settings, "llm_local_url", "http://localhost:1234")
         remote_url = getattr(
-            self.settings, "llm_model_machine_url", "http://192.168.1.143:1234"
+            self.settings, "llm_model_machine_url", "http://192.168.1.89:1234"
         )
 
         if routing_enabled and remote_url and remote_url != local_url:
