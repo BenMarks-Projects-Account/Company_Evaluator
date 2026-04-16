@@ -68,8 +68,15 @@ def _get_fmp_client():
     return _fmp_client
 
 
-async def evaluate_company(symbol: str, force: bool = False) -> dict:
-    """Full evaluation: fetch → compute → store → return."""
+async def evaluate_company(symbol: str, force: bool = False, skip_rankings: bool = False) -> dict:
+    """Full evaluation: fetch → compute → store → return.
+
+    skip_rankings: if True, do NOT recompute the global ranking after this
+    symbol. The crawler uses this to batch rankings updates (call
+    ``_update_rankings()`` once per chunk instead of once per symbol).
+    On-demand and API callers leave this False so rankings refresh
+    immediately after every single evaluation.
+    """
     symbol = symbol.upper()
     t0 = time.time()
     _log.info("="*60)
@@ -263,11 +270,14 @@ async def evaluate_company(symbol: str, force: bool = False) -> dict:
 
     _log.info("[%s] Step 4/5: Database save complete in %.1fs (upsert + history)", symbol, time.time() - t4)
 
-    # Step 5: Update rankings
-    _log.info("[%s] Step 5/5: Updating rankings...", symbol)
-    t5 = time.time()
-    await _update_rankings()
-    _log.info("[%s] Step 5/5: Rankings updated in %.1fs", symbol, time.time() - t5)
+    # Step 5: Update rankings (skipped when called from crawler batch loop)
+    if skip_rankings:
+        _log.info("[%s] Step 5/5: Rankings update deferred (batch mode)", symbol)
+    else:
+        _log.info("[%s] Step 5/5: Updating rankings...", symbol)
+        t5 = time.time()
+        await _update_rankings()
+        _log.info("[%s] Step 5/5: Rankings updated in %.1fs", symbol, time.time() - t5)
 
     elapsed_total = time.time() - t0
     _log.info("=" * 60)

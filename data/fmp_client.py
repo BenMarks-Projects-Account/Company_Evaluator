@@ -217,7 +217,31 @@ class FMPClient:
     async def get_institutional_ownership(self, symbol: str,
                                            year: int | None = None,
                                            quarter: int | None = None) -> list[dict] | None:
-        """Fetch institutional positions summary for a symbol."""
+        """Fetch institutional positions summary for a symbol.
+
+        SHORT-CIRCUITED 2026-04-16: FMP's
+        ``/institutional-ownership/symbol-positions-summary`` endpoint has
+        been returning HTTP 400 for every symbol tested (10/10 in perf
+        audit). Returning ``None`` immediately avoids the ~1s round-trip
+        and the noisy WARNING log per symbol. Smart-money analysis already
+        handles ``None`` institutional data.
+
+        Re-test periodically: if FMP restores the endpoint, remove this
+        early return and let the request flow through.
+        """
+        _log.debug(
+            "[FMP] get_institutional_ownership short-circuited for %s "
+            "(endpoint broken)",
+            symbol,
+        )
+        return None
+
+    async def _get_institutional_ownership_raw(self, symbol: str,
+                                                year: int | None = None,
+                                                quarter: int | None = None) -> list[dict] | None:
+        """Internal: original institutional-ownership request. Kept so the
+        short-circuit above can be removed (or this helper called directly
+        in a periodic health check) once FMP fixes the endpoint."""
         p: dict = {"symbol": symbol}
         if year:
             p["year"] = year

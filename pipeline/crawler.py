@@ -6,10 +6,16 @@ import logging
 import time
 from datetime import datetime, timezone
 from pathlib import Path
-from pipeline.evaluator import evaluate_company
+from pipeline.evaluator import evaluate_company, _update_rankings
 from config import get_settings
 
 _log = logging.getLogger(__name__)
+
+# Recompute global rankings every N symbols during a crawl instead of
+# after every symbol. Per-symbol rankings recompute costs ~15s on a
+# ~2k-row DB; batching brings that to ~0.15s/symbol amortized while
+# keeping rankings reasonably fresh for the UI.
+RANKINGS_UPDATE_INTERVAL = 100
 
 
 def _get_state_file() -> Path:
@@ -284,7 +290,7 @@ class Crawler:
 
                 eval_start = time.time()
                 try:
-                    result = await evaluate_company(symbol)
+                    result = await evaluate_company(symbol, skip_rankings=True)
 
                     if result.get("status") == "complete":
                         evaluated += 1
@@ -342,6 +348,20 @@ class Crawler:
                     current_cycle, evaluated, failed,
                 ))
 
+                # Periodic rankings refresh — amortizes the ~15s/symbol
+                # cost of the full re-sort over many symbols while keeping
+                # rankings fresh enough for the UI during multi-hour crawls.
+                if (i + 1) % RANKINGS_UPDATE_INTERVAL == 0:
+                    try:
+                        rk_t0 = time.time()
+                        await _update_rankings()
+                        _log.info(
+                            "CRAWLER: Rankings updated at symbol %d/%d (%.1fs)",
+                            i + 1, total, time.time() - rk_t0,
+                        )
+                    except Exception as exc:
+                        _log.warning("Periodic rankings update failed: %s", exc)
+
                 await asyncio.sleep(pause_sec)
 
             # ── End of inner loop ────────────────────────────────
@@ -355,6 +375,18 @@ class Crawler:
                 current_cycle, total, evaluated, failed,
             )
             _log.info("=" * 60)
+
+            # Final rankings refresh at end of cycle — guarantees the
+            # leaderboard reflects every symbol evaluated in this cycle,
+            # even the last (RANKINGS_UPDATE_INTERVAL - 1) ones that did
+            # not trigger the periodic refresh.
+            try:
+                rk_t0 = time.time()
+                await _update_rankings()
+                _log.info("CRAWLER: Final rankings update after cycle %d (%.1fs)",
+                          current_cycle, time.time() - rk_t0)
+            except Exception as exc:
+                _log.warning("Final rankings update failed: %s", exc)
 
             self._last_cycle_completed_at = datetime.now(timezone.utc).isoformat()
 
@@ -394,6 +426,15 @@ class Crawler:
         self._running = False
         self._paused = False
         self._current_symbol = None
+
+        # Flush rankings on shutdown so the leaderboard reflects all
+        # symbols evaluated before the stop (rankings may have been
+        # deferred in batch mode).
+        try:
+            await _update_rankings()
+            _log.info("CRAWLER: Rankings flushed on shutdown")
+        except Exception as exc:
+            _log.warning("Shutdown rankings flush failed: %s", exc)
 
         elapsed_total = time.time() - self._start_time
         return {

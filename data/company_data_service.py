@@ -68,23 +68,31 @@ class CompanyDataService:
         self._router = get_router()
 
     async def get_company_data(self, symbol: str) -> dict:
-        """Fetch ALL data needed for company evaluation."""
+        """Fetch ALL data needed for company evaluation.
+
+        Phase 1 fires every independent fetch concurrently via
+        ``asyncio.gather`` (Polygon financials/prices/details, Finnhub
+        metrics/profile/insiders/recs, Yahoo ownership, FMP insider
+        trading + stats + profile). Phase 2 runs the FMP financials
+        fallback only if Polygon returned empty. Phase 3 is purely
+        local processing (smart-money analysis + profile merge).
+
+        Every fetch is still wrapped in ``_safe``, so individual
+        failures return ``{"error": ...}`` / ``None`` instead of
+        cancelling the whole batch.
+        """
         import time
         t0 = time.time()
-        _log.info("[%s] DATA: Begin fetching from all sources...", symbol)
+        _log.info("[%s] DATA: Begin fetching from all sources (parallel)...", symbol)
         fetched_at = datetime.now(timezone.utc).isoformat()
         source_attribution: dict[str, dict] = {}
         fetch_errors: list[dict] = []
 
-        # === POLYGON: Financial statements + price history ===
-        financials_quarterly = None
-        financials_annual = None
-        price_history = None
-        company_details = None
+        # ── Phase 1: all independent fetches ──────────────────────
+        tasks: dict[str, object] = {}
 
         if self._polygon:
-            _log.info("[%s] DATA: Fetching quarterly financials...", symbol)
-            financials_quarterly = await self._safe(
+            tasks["financials_quarterly"] = self._safe(
                 "polygon_financials_q",
                 self._routed_get_financials, symbol, limit=12, timeframe="quarterly",
                 provider="polygon",
@@ -92,8 +100,7 @@ class CompanyDataService:
                 source_attribution=source_attribution,
                 fetch_errors=fetch_errors,
             )
-            _log.info("[%s] DATA: Fetching annual financials...", symbol)
-            financials_annual = await self._safe(
+            tasks["financials_annual"] = self._safe(
                 "polygon_financials_a",
                 self._routed_get_financials, symbol, limit=8, timeframe="annual",
                 provider="polygon",
@@ -101,8 +108,7 @@ class CompanyDataService:
                 source_attribution=source_attribution,
                 fetch_errors=fetch_errors,
             )
-            _log.info("[%s] DATA: Fetching price history...", symbol)
-            price_history = await self._safe(
+            tasks["price_history"] = self._safe(
                 "polygon_prices",
                 self._routed_get_price_history, symbol, days=365,
                 provider="polygon",
@@ -110,8 +116,7 @@ class CompanyDataService:
                 source_attribution=source_attribution,
                 fetch_errors=fetch_errors,
             )
-            _log.info("[%s] DATA: Fetching company details...", symbol)
-            company_details = await self._safe(
+            tasks["company_details"] = self._safe(
                 "polygon_details",
                 self._routed_get_company_details, symbol,
                 provider="polygon",
@@ -120,39 +125,29 @@ class CompanyDataService:
                 fetch_errors=fetch_errors,
             )
 
-        # === FINNHUB: Ratios, profile, insiders, recommendations ===
-        basic_financials = None
-        profile = None
-        insiders = None
-        recommendations = None
-
         if self._finnhub:
-            _log.info("[%s] DATA: Fetching Finnhub basic financials (117 ratios)...", symbol)
-            basic_financials = await self._safe(
+            tasks["basic_financials"] = self._safe(
                 "finnhub_metrics", self._finnhub.get_basic_financials, symbol,
                 provider="finnhub",
                 endpoint="/stock/metric",
                 source_attribution=source_attribution,
                 fetch_errors=fetch_errors,
             )
-            _log.info("[%s] DATA: Fetching Finnhub company profile...", symbol)
-            profile = await self._safe(
+            tasks["profile"] = self._safe(
                 "finnhub_profile", self._finnhub.get_company_profile, symbol,
                 provider="finnhub",
                 endpoint="/stock/profile2",
                 source_attribution=source_attribution,
                 fetch_errors=fetch_errors,
             )
-            _log.info("[%s] DATA: Fetching Finnhub insider transactions...", symbol)
-            insiders = await self._safe(
+            tasks["insiders"] = self._safe(
                 "finnhub_insiders", self._finnhub.get_insider_transactions, symbol,
                 provider="finnhub",
                 endpoint="/stock/insider-transactions",
                 source_attribution=source_attribution,
                 fetch_errors=fetch_errors,
             )
-            _log.info("[%s] DATA: Fetching Finnhub recommendations...", symbol)
-            recommendations = await self._safe(
+            tasks["recommendations"] = self._safe(
                 "finnhub_recs", self._finnhub.get_recommendation_trends, symbol,
                 provider="finnhub",
                 endpoint="/stock/recommendation",
@@ -160,7 +155,64 @@ class CompanyDataService:
                 fetch_errors=fetch_errors,
             )
 
-        # === FMP FALLBACK: Only if Polygon financials are empty ===
+        if self._yahoo_enabled:
+            tasks["yahoo_ownership"] = self._fetch_yahoo_ownership(symbol)
+
+        if self._fmp:
+            tasks["fmp_insider_txns"] = self._safe(
+                "fmp_insider_trading", self._fmp.get_insider_trading, symbol,
+                provider="fmp", endpoint="/insider-trading/search",
+                source_attribution=source_attribution,
+                fetch_errors=fetch_errors,
+            )
+            tasks["fmp_insider_stats"] = self._safe(
+                "fmp_insider_stats", self._fmp.get_insider_trading_statistics, symbol,
+                provider="fmp", endpoint="/insider-trading/statistics",
+                source_attribution=source_attribution,
+                fetch_errors=fetch_errors,
+            )
+            tasks["fmp_profile"] = self._safe(
+                "fmp_profile", self._fmp.get_company_profile, symbol,
+                provider="fmp",
+                endpoint="/v3/profile/{symbol}",
+                source_attribution=source_attribution,
+                fetch_errors=fetch_errors,
+            )
+
+        keys = list(tasks.keys())
+        results = await asyncio.gather(*tasks.values(), return_exceptions=True)
+        bundle: dict = {}
+        for key, res in zip(keys, results):
+            if isinstance(res, Exception):
+                _log.warning("[%s] DATA: gather task %s raised: %s", symbol, key, res)
+                bundle[key] = None
+            else:
+                bundle[key] = res
+
+        financials_quarterly = bundle.get("financials_quarterly")
+        financials_annual = bundle.get("financials_annual")
+        price_history = bundle.get("price_history")
+        company_details = bundle.get("company_details")
+        basic_financials = bundle.get("basic_financials")
+        profile = bundle.get("profile")
+        insiders = bundle.get("insiders")
+        recommendations = bundle.get("recommendations")
+        yahoo_ownership = bundle.get("yahoo_ownership")
+        insider_txns = bundle.get("fmp_insider_txns")
+        insider_stats = bundle.get("fmp_insider_stats")
+        fmp_profile = bundle.get("fmp_profile")
+
+        # Institutional ownership: FMP endpoint short-circuited (2026-04-16;
+        # see FMPClient.get_institutional_ownership). Keep variable None so
+        # downstream smart-money analysis falls through cleanly.
+        institutional = None
+
+        _log.info(
+            "[%s] DATA: Phase 1 parallel fetch complete in %.1fs",
+            symbol, time.time() - t0,
+        )
+
+        # ── Phase 2: FMP financials fallback (depends on Polygon result) ──
         q_patched_fmp = False
         a_patched_fmp = False
         if self._fmp:
@@ -175,8 +227,9 @@ class CompanyDataService:
                 )
                 from data.fmp_normalizer import normalize_fmp_to_scorer_shape
 
+                fallback_tasks: dict[str, object] = {}
                 if q_empty:
-                    fmp_q_raw = await self._safe(
+                    fallback_tasks["q"] = self._safe(
                         "fmp_financials_q",
                         self._fmp.get_full_financials, symbol, period="quarter", limit=12,
                         provider="fmp",
@@ -184,18 +237,8 @@ class CompanyDataService:
                         source_attribution=source_attribution,
                         fetch_errors=fetch_errors,
                     )
-                    if fmp_q_raw and not fmp_q_raw.get("error"):
-                        normalized = normalize_fmp_to_scorer_shape(fmp_q_raw)
-                        if normalized.get("statements"):
-                            financials_quarterly = normalized
-                            q_patched_fmp = True
-                            _log.info(
-                                "[%s] FMP quarterly fallback: %d statements",
-                                symbol, len(normalized["statements"]),
-                            )
-
                 if a_empty:
-                    fmp_a_raw = await self._safe(
+                    fallback_tasks["a"] = self._safe(
                         "fmp_financials_a",
                         self._fmp.get_full_financials, symbol, period="annual", limit=10,
                         provider="fmp",
@@ -203,49 +246,36 @@ class CompanyDataService:
                         source_attribution=source_attribution,
                         fetch_errors=fetch_errors,
                     )
-                    if fmp_a_raw and not fmp_a_raw.get("error"):
-                        normalized = normalize_fmp_to_scorer_shape(fmp_a_raw)
-                        if normalized.get("statements"):
-                            financials_annual = normalized
-                            a_patched_fmp = True
-                            _log.info(
-                                "[%s] FMP annual fallback: %d statements",
-                                symbol, len(normalized["statements"]),
-                            )
+                fb_keys = list(fallback_tasks.keys())
+                fb_results = await asyncio.gather(*fallback_tasks.values(), return_exceptions=True)
+                for key, res in zip(fb_keys, fb_results):
+                    if isinstance(res, Exception) or res is None or (isinstance(res, dict) and res.get("error")):
+                        continue
+                    normalized = normalize_fmp_to_scorer_shape(res)
+                    if not normalized.get("statements"):
+                        continue
+                    if key == "q":
+                        financials_quarterly = normalized
+                        q_patched_fmp = True
+                        _log.info(
+                            "[%s] FMP quarterly fallback: %d statements",
+                            symbol, len(normalized["statements"]),
+                        )
+                    elif key == "a":
+                        financials_annual = normalized
+                        a_patched_fmp = True
+                        _log.info(
+                            "[%s] FMP annual fallback: %d statements",
+                            symbol, len(normalized["statements"]),
+                        )
 
-        # === YAHOO OWNERSHIP ENRICHMENT (lightweight) ===
-        yahoo_ownership = None
-        if self._yahoo_enabled:
-            yahoo_ownership = await self._fetch_yahoo_ownership(symbol)
-
-        # === FMP SMART MONEY: Insider transactions + Institutional ownership ===
+        # ── Phase 3: local post-processing (smart-money + profile merge) ──
         smart_money = None
         if self._fmp:
             try:
                 from data.smart_money_analyzer import (
                     analyze_insider_activity,
                     analyze_institutional_ownership,
-                )
-
-                _log.info("[%s] DATA: Fetching FMP insider trading...", symbol)
-                insider_txns = await self._safe(
-                    "fmp_insider_trading", self._fmp.get_insider_trading, symbol,
-                    provider="fmp", endpoint="/insider-trading/search",
-                    source_attribution=source_attribution,
-                    fetch_errors=fetch_errors,
-                )
-                insider_stats = await self._safe(
-                    "fmp_insider_stats", self._fmp.get_insider_trading_statistics, symbol,
-                    provider="fmp", endpoint="/insider-trading/statistics",
-                    source_attribution=source_attribution,
-                    fetch_errors=fetch_errors,
-                )
-                _log.info("[%s] DATA: Fetching FMP institutional ownership...", symbol)
-                institutional = await self._safe(
-                    "fmp_institutional", self._fmp.get_institutional_ownership, symbol,
-                    provider="fmp", endpoint="/institutional-ownership/symbol-positions-summary",
-                    source_attribution=source_attribution,
-                    fetch_errors=fetch_errors,
                 )
 
                 insider_analysis = analyze_insider_activity(
@@ -283,17 +313,6 @@ class CompanyDataService:
                 "net_shares_180d": smart_money["insider_activity"]["net_shares"],
                 "_source": "fmp_smart_money",
             }
-
-        # === FMP PROFILE: Clean sector/industry labels ===
-        fmp_profile = None
-        if self._fmp:
-            fmp_profile = await self._safe(
-                "fmp_profile", self._fmp.get_company_profile, symbol,
-                provider="fmp",
-                endpoint="/v3/profile/{symbol}",
-                source_attribution=source_attribution,
-                fetch_errors=fetch_errors,
-            )
 
         # === MERGE PROFILE from best source ===
         merged_profile = self._merge_profile(company_details, profile, yahoo_ownership, fmp_profile=fmp_profile)
