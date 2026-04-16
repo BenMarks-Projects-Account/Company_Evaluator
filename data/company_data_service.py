@@ -38,15 +38,32 @@ class CompanyDataService:
 
         # FMP — statement fallback when Polygon is empty
         from data.fmp_client import FMPClient
-        self._fmp = (
-            FMPClient(
+        self._fmp = None
+        if settings.fmp_enabled and settings.fmp_api_key:
+            raw_fmp = FMPClient(
                 api_key=settings.fmp_api_key,
                 base_url=settings.fmp_base_url,
                 rate_limit_per_min=settings.fmp_rate_limit_per_min,
             )
-            if settings.fmp_enabled and settings.fmp_api_key
-            else None
-        )
+            # Wrap with bulk cache if available
+            if settings.enable_bulk_cache:
+                from pathlib import Path
+                cache_db = Path(settings.database_path).parent / "company_eval_bulk.db"
+                if cache_db.exists():
+                    from bulk.bulk_cache import BulkCache
+                    from bulk.cache_lookup import BulkCacheLookup
+                    from bulk.cached_fmp_client import CachedFMPClient
+                    cache = BulkCache(str(cache_db))
+                    lookup = BulkCacheLookup(cache)
+                    if lookup.is_available():
+                        self._fmp = CachedFMPClient(raw_fmp, lookup)
+                        _log.info("CompanyDataService FMP using bulk cache")
+                    else:
+                        self._fmp = raw_fmp
+                else:
+                    self._fmp = raw_fmp
+            else:
+                self._fmp = raw_fmp
 
         self._router = get_router()
 

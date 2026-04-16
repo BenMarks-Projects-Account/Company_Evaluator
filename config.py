@@ -69,6 +69,7 @@ class Settings(BaseSettings):
     fmp_enabled: bool = False         # Enable FMP (cross-validation + statement fallback)
     fmp_rate_limit_per_min: int = 300 # Paid tier: 300 req/min
     fmp_base_url: str = "https://financialmodelingprep.com/stable"
+    enable_bulk_cache: bool = True    # Wrap FMPClient with CachedFMPClient when bulk DB exists
 
     # Data source routing — per-call-site overrides for Polygon→FMP migration.
     # JSON string mapping call-site keys to "polygon", "fmp", or "shadow".

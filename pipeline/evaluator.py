@@ -27,7 +27,11 @@ def _get_data_service():
 
 
 def _get_fmp_client():
-    """Lazily create FMP client if enabled and configured."""
+    """Lazily create FMP client if enabled and configured.
+
+    Returns CachedFMPClient (with bulk cache) when cache DB exists
+    and enable_bulk_cache is True, otherwise plain FMPClient.
+    """
     global _fmp_client
     if _fmp_client is not None:
         return _fmp_client
@@ -38,11 +42,29 @@ def _get_fmp_client():
         return None
 
     from data.fmp_client import FMPClient
-    _fmp_client = FMPClient(
+    raw_client = FMPClient(
         api_key=settings.fmp_api_key,
         base_url=settings.fmp_base_url,
         rate_limit_per_min=settings.fmp_rate_limit_per_min,
     )
+
+    # Wrap with bulk cache if available
+    if settings.enable_bulk_cache:
+        from pathlib import Path
+        cache_db = Path(settings.database_path).parent / "company_eval_bulk.db"
+        if cache_db.exists():
+            from bulk.bulk_cache import BulkCache
+            from bulk.cache_lookup import BulkCacheLookup
+            from bulk.cached_fmp_client import CachedFMPClient
+            cache = BulkCache(str(cache_db))
+            lookup = BulkCacheLookup(cache)
+            if lookup.is_available():
+                _fmp_client = CachedFMPClient(raw_client, lookup)
+                _log.info("FMP client using bulk cache at %s", cache_db)
+                return _fmp_client
+
+    _fmp_client = raw_client
+    _log.info("FMP client using direct API (no bulk cache)")
     return _fmp_client
 
 
