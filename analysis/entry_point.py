@@ -16,6 +16,7 @@ from datetime import date, datetime, timedelta, timezone
 from config import get_settings
 from data.polygon_client import PolygonClient
 from data.finnhub_client import FinnhubClient
+from data.data_source_router import get_router
 
 _log = logging.getLogger(__name__)
 
@@ -844,26 +845,94 @@ async def analyze_entry_point(symbol: str, skip_llm: bool = False) -> dict:
         rate_limit=settings.finnhub_rate_limit,
     )
 
+    # FMP client for routed calls
+    fmp = None
+    if settings.fmp_enabled and settings.fmp_api_key:
+        from data.fmp_client import FMPClient
+        fmp = FMPClient(
+            api_key=settings.fmp_api_key,
+            base_url=settings.fmp_base_url,
+            rate_limit_per_min=settings.fmp_rate_limit_per_min,
+        )
+    router = get_router()
+
+    # ── FMP adapter functions (translate Polygon arg conventions) ──
+    async def _fmp_bars(symbol_arg, days=365):
+        if fmp is None:
+            return None
+        from_date = (date.today() - timedelta(days=days)).isoformat()
+        return await fmp.get_historical_price_eod(symbol_arg, from_date=from_date)
+
+    async def _fmp_rsi(symbol_arg, window=14):
+        if fmp is None:
+            return None
+        return await fmp.get_technical_indicator(symbol_arg, "rsi", window)
+
+    async def _fmp_sma(symbol_arg, window=20):
+        if fmp is None:
+            return None
+        return await fmp.get_technical_indicator(symbol_arg, "sma", window)
+
     symbol = symbol.upper().strip()
     _log.info("Entry point analysis starting for %s", symbol)
 
-    # ── Fetch data concurrently — Polygon Starter has unlimited calls ─
-    bars_task = asyncio.create_task(polygon.get_raw_bars(symbol, days=365))
-    spy_bars_task = asyncio.create_task(polygon.get_raw_bars("SPY", days=120))
+    # ── Fetch data concurrently — routed through data source router ─
+    bars_task = asyncio.create_task(router.route(
+        "entry_point.get_raw_bars", polygon.get_raw_bars,
+        _fmp_bars if fmp else None,
+        symbol, days=365,
+    ))
+    spy_bars_task = asyncio.create_task(router.route(
+        "entry_point.get_raw_bars", polygon.get_raw_bars,
+        _fmp_bars if fmp else None,
+        "SPY", days=120,
+    ))
 
     # VIX — try Polygon index ticker I:VIX first
-    vix_bars_task = asyncio.create_task(polygon.get_raw_bars("I:VIX", days=60))
+    vix_bars_task = asyncio.create_task(router.route(
+        "entry_point.get_raw_bars", polygon.get_raw_bars,
+        _fmp_bars if fmp else None,
+        "I:VIX", days=60,
+    ))
 
-    # Polygon TA indicators (primary — faster and more reliable)
-    polygon_rsi_task = asyncio.create_task(polygon.get_rsi(symbol, window=14))
-    polygon_sma20_task = asyncio.create_task(polygon.get_sma(symbol, window=20))
-    polygon_sma50_task = asyncio.create_task(polygon.get_sma(symbol, window=50))
-    polygon_sma200_task = asyncio.create_task(polygon.get_sma(symbol, window=200))
-    polygon_macd_task = asyncio.create_task(polygon.get_macd(symbol))
-    spy_rsi_task = asyncio.create_task(polygon.get_rsi("SPY", window=14))
+    # TA indicators (routed — Polygon primary, FMP available)
+    polygon_rsi_task = asyncio.create_task(router.route(
+        "entry_point.get_rsi", polygon.get_rsi,
+        _fmp_rsi if fmp else None,
+        symbol, window=14,
+    ))
+    polygon_sma20_task = asyncio.create_task(router.route(
+        "entry_point.get_sma", polygon.get_sma,
+        _fmp_sma if fmp else None,
+        symbol, window=20,
+    ))
+    polygon_sma50_task = asyncio.create_task(router.route(
+        "entry_point.get_sma", polygon.get_sma,
+        _fmp_sma if fmp else None,
+        symbol, window=50,
+    ))
+    polygon_sma200_task = asyncio.create_task(router.route(
+        "entry_point.get_sma", polygon.get_sma,
+        _fmp_sma if fmp else None,
+        symbol, window=200,
+    ))
+    polygon_macd_task = asyncio.create_task(router.route(
+        "entry_point.get_macd", polygon.get_macd,
+        fmp.get_macd if fmp else None,
+        symbol,
+    ))
+    spy_rsi_task = asyncio.create_task(router.route(
+        "entry_point.get_rsi", polygon.get_rsi,
+        _fmp_rsi if fmp else None,
+        "SPY", window=14,
+    ))
 
-    # Polygon snapshot for near-real-time quote (15-min delayed)
-    snapshot_task = asyncio.create_task(polygon.get_snapshot(symbol))
+    # Snapshot for near-real-time quote (routed)
+    snapshot_task = asyncio.create_task(router.route(
+        "entry_point.get_snapshot", polygon.get_snapshot,
+        fmp.get_quote if fmp else None,
+        symbol,
+    ))
 
     # Finnhub calls (concurrent — different rate limiter)
     price_target_task = asyncio.create_task(finnhub.get_price_target(symbol))

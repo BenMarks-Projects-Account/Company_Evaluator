@@ -144,8 +144,21 @@ if __name__ == "__main__":
     import traceback
     from datetime import datetime
     settings = get_settings()
+
+    # Only enable reload when running interactively AND the port is free.
+    # The launcher already omits --reload, so this only affects `python main.py`.
+    use_reload = settings.debug and os.environ.get("EVALUATOR_NO_RELOAD") != "1"
+    if use_reload:
+        import socket as _sock
+        with _sock.socket(_sock.AF_INET, _sock.SOCK_STREAM) as _s:
+            try:
+                _s.bind((settings.host, settings.port))
+            except OSError:
+                _log.warning("Port %s already in use — disabling reload", settings.port)
+                use_reload = False
+
     try:
-        uvicorn.run("main:app", host=settings.host, port=settings.port, reload=settings.debug)
+        uvicorn.run("main:app", host=settings.host, port=settings.port, reload=use_reload)
     except Exception as e:
         crash_file = LOG_DIR / f"crash_{datetime.now().strftime('%Y%m%d_%H%M%S')}.log"
         crash_file.write_text(traceback.format_exc(), encoding="utf-8")

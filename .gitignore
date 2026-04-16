@@ -19,9 +19,12 @@ db/*.db
 db/*.db-journal
 db/*.db-wal
 db/*.db-shm
+db/*.local-backup-*
+db/*.bak
 
 # Logs
-logs/*.log
+logs/*
+!logs/.gitkeep
 
 # Data cache
 data/cache/
@@ -37,3 +40,7 @@ Thumbs.db
 # PyInstaller
 *.spec
 *.manifest
+
+# Runtime state
+.evaluator.lock
+.evaluator_spawns.json

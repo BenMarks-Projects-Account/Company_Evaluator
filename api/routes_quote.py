@@ -8,6 +8,7 @@ from fastapi import APIRouter
 from config import get_settings
 from data.polygon_client import PolygonClient
 from data.finnhub_client import FinnhubClient
+from data.data_source_router import get_router
 
 _log = logging.getLogger(__name__)
 
@@ -20,10 +21,27 @@ async def get_quote(symbol: str):
     symbol = symbol.upper().strip()
     settings = get_settings()
 
-    # ── Try Polygon snapshot ─────────────────────────────────
+    # ── Try Polygon snapshot (routed) ──────────────────────────
     try:
         polygon = PolygonClient(api_key=settings.polygon_api_key, rate_limit=settings.polygon_rate_limit)
-        snap = await polygon.get_snapshot(symbol)
+
+        fmp_quote_fn = None
+        if settings.fmp_enabled and settings.fmp_api_key:
+            from data.fmp_client import FMPClient
+            _fmp = FMPClient(
+                api_key=settings.fmp_api_key,
+                base_url=settings.fmp_base_url,
+                rate_limit_per_min=settings.fmp_rate_limit_per_min,
+            )
+            fmp_quote_fn = _fmp.get_quote
+
+        router = get_router()
+        snap = await router.route(
+            "routes_quote.get_snapshot",
+            polygon.get_snapshot,
+            fmp_quote_fn,
+            symbol,
+        )
         if snap and snap.get("last_price"):
             price = snap["last_price"]
             prev_close = snap.get("prev_close")

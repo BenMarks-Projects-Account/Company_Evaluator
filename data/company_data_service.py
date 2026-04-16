@@ -22,6 +22,7 @@ class CompanyDataService:
 
         from data.polygon_client import PolygonClient
         from data.finnhub_client import FinnhubClient
+        from data.data_source_router import get_router
 
         self._polygon = (
             PolygonClient(settings.polygon_api_key, settings.polygon_rate_limit)
@@ -47,6 +48,8 @@ class CompanyDataService:
             else None
         )
 
+        self._router = get_router()
+
     async def get_company_data(self, symbol: str) -> dict:
         """Fetch ALL data needed for company evaluation."""
         import time
@@ -63,37 +66,37 @@ class CompanyDataService:
         company_details = None
 
         if self._polygon:
-            _log.info("[%s] DATA: Fetching Polygon quarterly financials...", symbol)
+            _log.info("[%s] DATA: Fetching quarterly financials...", symbol)
             financials_quarterly = await self._safe(
                 "polygon_financials_q",
-                self._polygon.get_financials, symbol, limit=12, timeframe="quarterly",
+                self._routed_get_financials, symbol, limit=12, timeframe="quarterly",
                 provider="polygon",
                 endpoint="/vX/reference/financials",
                 source_attribution=source_attribution,
                 fetch_errors=fetch_errors,
             )
-            _log.info("[%s] DATA: Fetching Polygon annual financials...", symbol)
+            _log.info("[%s] DATA: Fetching annual financials...", symbol)
             financials_annual = await self._safe(
                 "polygon_financials_a",
-                self._polygon.get_financials, symbol, limit=8, timeframe="annual",
+                self._routed_get_financials, symbol, limit=8, timeframe="annual",
                 provider="polygon",
                 endpoint="/vX/reference/financials",
                 source_attribution=source_attribution,
                 fetch_errors=fetch_errors,
             )
-            _log.info("[%s] DATA: Fetching Polygon price history...", symbol)
+            _log.info("[%s] DATA: Fetching price history...", symbol)
             price_history = await self._safe(
                 "polygon_prices",
-                self._polygon.get_price_history, symbol, days=365,
+                self._routed_get_price_history, symbol, days=365,
                 provider="polygon",
                 endpoint="/v2/aggs/ticker/{symbol}/range/1/day",
                 source_attribution=source_attribution,
                 fetch_errors=fetch_errors,
             )
-            _log.info("[%s] DATA: Fetching Polygon company details...", symbol)
+            _log.info("[%s] DATA: Fetching company details...", symbol)
             company_details = await self._safe(
                 "polygon_details",
-                self._polygon.get_company_details, symbol,
+                self._routed_get_company_details, symbol,
                 provider="polygon",
                 endpoint="/v3/reference/tickers/{symbol}",
                 source_attribution=source_attribution,
@@ -412,6 +415,117 @@ class CompanyDataService:
         if score >= 1:
             return "partial"
         return "degraded"
+
+    # ── FMP adapter helpers ────────────────────────────────────
+
+    async def _fmp_get_financials(self, symbol: str, limit: int = 12, timeframe: str = "quarterly"):
+        """Adapter: FMP get_full_financials + normalizer → Polygon shape."""
+        from data.fmp_normalizer import normalize_fmp_to_scorer_shape
+        period = "quarter" if timeframe == "quarterly" else "annual"
+        raw = await self._fmp.get_full_financials(symbol, period=period, limit=limit)
+        if not raw:
+            return {"error": "No financial data returned", "results": []}
+        normalized = normalize_fmp_to_scorer_shape(raw)
+        # Add wrapper fields that Polygon includes at top level
+        stmts = normalized.get("statements", [])
+        return {
+            "symbol": symbol,
+            "timeframe": timeframe,
+            "count": len(stmts),
+            "statements": stmts,
+        }
+
+    async def _fmp_get_price_history(self, symbol: str, days: int = 365):
+        """Adapter: FMP EOD bars → Polygon get_price_history derived-stats shape."""
+        import numpy as np
+        from datetime import date, timedelta
+
+        end = date.today()
+        start = end - timedelta(days=days)
+        bars = await self._fmp.get_historical_price_eod(
+            symbol, from_date=start.isoformat(), to_date=end.isoformat()
+        )
+        if not bars:
+            return {"error": "No price history returned"}
+
+        closes = [b["close"] for b in bars if b.get("close") is not None]
+        highs = [b["high"] for b in bars if b.get("high") is not None]
+        lows = [b["low"] for b in bars if b.get("low") is not None]
+        volumes = [b["volume"] for b in bars if b.get("volume") is not None]
+
+        if len(closes) < 2:
+            return {"error": "Insufficient price data"}
+
+        daily_returns = np.diff(closes) / np.array(closes[:-1])
+
+        # Max drawdown: peak-to-trough
+        peak = closes[0]
+        max_dd = 0.0
+        for c in closes:
+            if c > peak:
+                peak = c
+            dd = (c - peak) / peak
+            if dd < max_dd:
+                max_dd = dd
+
+        std = float(np.std(daily_returns))
+        return {
+            "start_date": start.isoformat(),
+            "end_date": end.isoformat(),
+            "data_points": len(closes),
+            "current_price": closes[-1],
+            "year_high": max(highs) if highs else None,
+            "year_low": min(lows) if lows else None,
+            "year_return": (closes[-1] / closes[0]) - 1,
+            "avg_daily_volume": sum(volumes) / len(volumes) if volumes else None,
+            "volatility_annualized": float(np.std(daily_returns) * np.sqrt(252)),
+            "max_drawdown": float(max_dd),
+            "sharpe_approx": float(np.mean(daily_returns) / std * np.sqrt(252)) if std > 0 else None,
+        }
+
+    # ── Routed Polygon call-site wrappers ────────────────────
+    async def _routed_get_financials(self, symbol: str, **kwargs):
+        return await self._router.route(
+            "company_data_service.get_financials",
+            self._polygon.get_financials,
+            self._fmp_get_financials if self._fmp else None,
+            symbol, **kwargs,
+        )
+
+    async def _routed_get_price_history(self, symbol: str, **kwargs):
+        return await self._router.route(
+            "company_data_service.get_price_history",
+            self._polygon.get_price_history,
+            self._fmp_get_price_history if self._fmp else None,
+            symbol, **kwargs,
+        )
+
+    async def _routed_get_company_details(self, symbol: str):
+        return await self._router.route(
+            "company_data_service.get_company_details",
+            self._polygon.get_company_details,
+            self._fmp_get_company_details if self._fmp else None,
+            symbol,
+        )
+
+    async def _fmp_get_company_details(self, symbol: str):
+        """Adapter: FMP get_company_profile → Polygon get_company_details shape."""
+        raw = await self._fmp.get_company_profile(symbol)
+        if not raw:
+            return None
+        return {
+            "symbol": raw.get("symbol"),
+            "company_name": raw.get("company_name"),
+            "market_cap": raw.get("market_cap"),
+            "sector": raw.get("sector"),
+            "primary_exchange": raw.get("exchange"),
+            "description": raw.get("description"),
+            "homepage": raw.get("website"),
+            "employees": raw.get("employees"),
+            "list_date": None,  # FMP doesn't provide IPO date on this endpoint
+            "locale": None,     # FMP doesn't provide locale
+            "type": None,       # FMP doesn't provide security type
+        }
 
     async def _safe(
         self,

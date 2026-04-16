@@ -130,21 +130,21 @@ class CrawlerScheduler:
 
         state = _load_state() or {}
         prev_status = state.get("status")
-        resume_idx = state.get("last_completed_index", -1) + 1
         cycle_number = state.get("cycle_number", 1)
         last_sym = state.get("last_completed_symbol")
 
-        # Resume from checkpoint for any halted state — "running" means the
-        # app was killed mid-cycle, "stopped" means the scheduler halted us
-        # (typically for market hours), "paused" means an explicit pause.
-        # All three carry a valid last_completed_index to resume from.
+        # Always start from index 0 — the freshness-ordered query
+        # naturally places the stalest (least-recently-evaluated) symbols
+        # first, so starting at 0 resumes where the previous run left off
+        # without the index-mismatch bug that occurred when applying an old
+        # checkpoint index to a freshly-sorted symbol list.
         if prev_status in ("running", "stopped", "paused"):
             _log.info(
-                "Scheduler: resuming crawler from checkpoint — "
-                "prev_status=%s resume_idx=%d last_sym=%s cycle=%d reason=%s",
-                prev_status, resume_idx, last_sym, cycle_number, reason,
+                "Scheduler: resuming crawler (freshness-ordered) — "
+                "prev_status=%s last_sym=%s cycle=%d reason=%s",
+                prev_status, last_sym, cycle_number, reason,
             )
-            asyncio.create_task(self.crawler.run(start_index=resume_idx, cycle_number=cycle_number))
+            asyncio.create_task(self.crawler.run(cycle_number=cycle_number))
             return
 
         _log.info("Scheduler: market closed (%s), auto-starting crawler (no checkpoint)", reason)

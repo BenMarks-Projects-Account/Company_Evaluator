@@ -215,17 +215,23 @@ def _valuation_data_section(evaluation: dict) -> str:
         emergence = epv.get("emergence") or {}
 
         lines.append(f"\n**EPV (Greenwald Earnings Power Value)**:")
-        if trailing.get("fair_value_per_share") is not None:
+        t_fv = trailing.get("fair_value_per_share")
+        if t_fv is not None:
+            t_prem = trailing.get("growth_premium_pct") or 0
+            t_label = trailing.get("growth_premium_label") or ""
             lines.append(
-                f"- Trailing (1y) EPV: ${trailing['fair_value_per_share']:.2f}/share, "
-                f"premium {trailing.get('growth_premium_pct', 0):.1f}% "
-                f"[{trailing.get('growth_premium_label', '')}]"
+                f"- Trailing (1y) EPV: ${t_fv:.2f}/share, "
+                f"premium {t_prem:.1f}% "
+                f"[{t_label}]"
             )
-        if normalized.get("fair_value_per_share") is not None:
+        n_fv = normalized.get("fair_value_per_share")
+        if n_fv is not None:
+            n_prem = normalized.get("growth_premium_pct") or 0
+            n_label = normalized.get("growth_premium_label") or ""
             lines.append(
-                f"- Normalized (5y) EPV: ${normalized['fair_value_per_share']:.2f}/share, "
-                f"premium {normalized.get('growth_premium_pct', 0):.1f}% "
-                f"[{normalized.get('growth_premium_label', '')}]"
+                f"- Normalized (5y) EPV: ${n_fv:.2f}/share, "
+                f"premium {n_prem:.1f}% "
+                f"[{n_label}]"
             )
         if emergence.get("signal"):
             lines.append(f"- **Emergence Signal**: {emergence['signal']}")
@@ -247,9 +253,11 @@ def _quality_data_section(evaluation: dict, pillars: dict) -> str:
 
     piotroski = evaluation.get("piotroski_f_score") or {}
     if piotroski.get("ok"):
+        p_score = piotroski.get("score") or 0
+        p_label = piotroski.get("label") or ""
         lines.append(
-            f"\n**Piotroski F-Score**: {piotroski.get('score', 0)}/9 "
-            f"({piotroski.get('label', '')})"
+            f"\n**Piotroski F-Score**: {p_score}/9 "
+            f"({p_label})"
         )
         if piotroski.get("interpretation"):
             lines.append(f"- {piotroski['interpretation']}")

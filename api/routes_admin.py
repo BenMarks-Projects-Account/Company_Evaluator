@@ -197,10 +197,28 @@ async def add_stock_to_universe(req: UniverseAddSingleRequest):
     # ── 2. Validate symbol — fetch company profile ───────────
     profile = None
 
-    # Try Polygon first
+    # Try Polygon first (routed)
     try:
+        from data.data_source_router import get_router
         polygon = PolygonClient(api_key=settings.polygon_api_key, rate_limit=settings.polygon_rate_limit)
-        ticker_data = await polygon.get_company_details(symbol)
+
+        fmp_profile_fn = None
+        if settings.fmp_api_key:
+            from data.fmp_client import FMPClient
+            _fmp = FMPClient(
+                api_key=settings.fmp_api_key,
+                base_url=settings.fmp_base_url,
+                rate_limit_per_min=settings.fmp_rate_limit_per_min,
+            )
+            fmp_profile_fn = _fmp.get_company_profile
+
+        router = get_router()
+        ticker_data = await router.route(
+            "routes_admin.get_company_details",
+            polygon.get_company_details,
+            fmp_profile_fn,
+            symbol,
+        )
         if ticker_data and not ticker_data.get("error") and ticker_data.get("company_name"):
             profile = {
                 "company_name": ticker_data["company_name"],

@@ -141,9 +141,9 @@ class Crawler:
     def _build_state(self, symbols, index, status, cycle, evaluated, failed):
         """Build a state dict for saving."""
         return {
-            "symbols": symbols,
             "last_completed_index": index,
             "last_completed_symbol": symbols[index] if 0 <= index < len(symbols) else None,
+            "total_symbols": len(symbols),
             "status": status,
             "cycle_number": cycle,
             "cycle_started_at": self._cycle_started_at,

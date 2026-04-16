@@ -112,7 +112,17 @@ async def get_research_prompt(symbol: str):
             pass
 
     company = result.get("company") or {}
-    prompt_text = build_research_prompt(result)
+
+    try:
+        prompt_text = build_research_prompt(result)
+    except Exception as e:
+        _log.exception("Failed to build research prompt for %s", symbol)
+        return {
+            "ok": False,
+            "symbol": symbol,
+            "error": f"Failed to build research prompt: {e}",
+            "generated_at": datetime.now(timezone.utc).isoformat() + "Z",
+        }
 
     return {
         "ok": True,

@@ -30,8 +30,11 @@ else:
     BASE_DIR = Path(__file__).resolve().parent
 
 # ── Paths ────────────────────────────────────────────────────
-LOG_DIR = BASE_DIR / "logs"
-LOG_FILE = LOG_DIR / "company_evaluator.log"
+_local_appdata = os.environ.get("LOCALAPPDATA", os.path.expanduser("~/AppData/Local"))
+LOG_DIR = Path(_local_appdata, "CompanyEvaluator", "logs")
+LOG_FILE = LOG_DIR / "company_evaluator_launcher.log"
+LOG_MAX_BYTES = 50 * 1024 * 1024  # 50 MB
+LOG_BACKUP_COUNT = 3
 LOCK_FILE = BASE_DIR / ".evaluator.lock"
 
 VENV_PYTHON = BASE_DIR / ".venv" / "Scripts" / "python.exe"
@@ -465,8 +468,40 @@ class LauncherApp(tk.Tk):
         tk.Frame(activity_card, bg=self.PANEL_LITE, height=3).pack()
 
     # ── Backend process ───────────────────────────────────────
+    @staticmethod
+    def _port_in_use(port: int = 8100) -> bool:
+        """Return True if *port* is already bound (another process owns it)."""
+        import socket
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+            try:
+                s.bind(("0.0.0.0", port))
+            except OSError:
+                return True
+            return False
+
     def _start_backend(self):
-        LOG_DIR.mkdir(exist_ok=True)
+        if self._port_in_use():
+            import logging
+            logging.getLogger(__name__).warning(
+                "Port 8100 already in use — skipping spawn."
+            )
+            # Port is occupied; attach to the existing backend instead of crashing.
+            self._stopping = False
+            self._poll_dashboard()
+            return
+
+        LOG_DIR.mkdir(parents=True, exist_ok=True)
+
+        # Rotate the launcher log if it exceeds the size limit
+        if LOG_FILE.exists() and LOG_FILE.stat().st_size > LOG_MAX_BYTES:
+            for i in range(LOG_BACKUP_COUNT, 0, -1):
+                src = LOG_FILE.with_suffix(f".log.{i}" if i > 0 else ".log")
+                dst = LOG_FILE.with_suffix(f".log.{i + 1}")
+                if i == LOG_BACKUP_COUNT and src.exists():
+                    src.unlink()
+                elif src.exists():
+                    src.rename(dst)
+            LOG_FILE.rename(LOG_FILE.with_suffix(".log.1"))
 
         # Ensure SQLite temp directory exists on the NAS
         sqlite_tmp = Path(r"\\192.168.1.149\CompanyEvaluatorData\company_evaluator\sqlite_temp")
@@ -482,6 +517,7 @@ class LauncherApp(tk.Tk):
         log_fh = open(LOG_FILE, "a", encoding="utf-8")
         env = os.environ.copy()
         env["PYTHONUNBUFFERED"] = "1"
+        env["EVALUATOR_NO_RELOAD"] = "1"
         env["SQLITE_TMPDIR"] = r"\\192.168.1.149\CompanyEvaluatorData\company_evaluator\sqlite_temp"
         # Windows uses TMP/TEMP for SQLite temp space — SQLITE_TMPDIR is Unix-only
         env["TMP"] = r"\\192.168.1.149\CompanyEvaluatorData\company_evaluator\sqlite_temp"

@@ -8,6 +8,7 @@ from datetime import datetime, timezone, timedelta
 from config import get_settings
 from data.polygon_client import PolygonClient
 from data.finnhub_client import FinnhubClient
+from data.data_source_router import get_router
 
 _log = logging.getLogger(__name__)
 
@@ -93,6 +94,13 @@ def _normalize_exchange(raw: str | None) -> str | None:
 class UniverseBuilder:
     """Builds the universe_symbols table from Polygon ticker data."""
 
+    # Polygon exchange codes → FMP exchange names
+    _EXCHANGE_MAP = {
+        "XNYS": "nyse",
+        "XNAS": "nasdaq",
+        "XASE": "amex",
+    }
+
     def __init__(self):
         settings = get_settings()
         self._polygon = PolygonClient(
@@ -102,6 +110,18 @@ class UniverseBuilder:
         self._finnhub = FinnhubClient(
             api_key=settings.finnhub_api_key,
             rate_limit=settings.finnhub_rate_limit,
+        )
+        self._router = get_router()
+
+        from data.fmp_client import FMPClient
+        self._fmp = (
+            FMPClient(
+                api_key=settings.fmp_api_key,
+                base_url=settings.fmp_base_url,
+                rate_limit_per_min=settings.fmp_rate_limit_per_min,
+            )
+            if settings.fmp_enabled and settings.fmp_api_key
+            else None
         )
 
     async def refresh_tier(self, tier: str) -> dict:
@@ -233,6 +253,38 @@ class UniverseBuilder:
 
     # ── Internal methods ─────────────────────────────────────
 
+    async def _fmp_get_tickers(self, **kwargs) -> list[dict]:
+        """Adapter: FMP stock_screener → Polygon get_tickers shape.
+
+        Translates Polygon kwargs (exchange, market, type, active, sort, order, limit)
+        to FMP stock_screener params, then maps response fields.
+        """
+        polygon_exchange = kwargs.get("exchange")
+        fmp_exchange = self._EXCHANGE_MAP.get(polygon_exchange, "nyse,nasdaq")
+
+        result = await self._fmp.stock_screener(
+            exchange=fmp_exchange,
+            is_actively_trading=kwargs.get("active", True),
+            is_etf=False,
+            is_fund=False,
+            limit=kwargs.get("limit", 1000),
+        )
+        if not result:
+            return []
+
+        # Map FMP field names → Polygon field names consumed by _upsert_tier
+        mapped = []
+        for item in result:
+            mapped.append({
+                "ticker": item.get("symbol"),
+                "name": item.get("companyName"),
+                "market_cap": item.get("marketCap"),
+                "primary_exchange": item.get("exchangeShortName"),
+                "active": item.get("isActivelyTrading", True),
+                "list_date": None,  # FMP screener doesn't provide listing date
+            })
+        return mapped
+
     async def _fetch_tickers_for_tier(self, tier: str, defn: dict) -> list[dict]:
         """Fetch tickers from Polygon matching a tier's criteria.
 
@@ -244,7 +296,10 @@ class UniverseBuilder:
         all_tickers = []
         for exchange in ("XNYS", "XNAS"):
             _log.info("Fetching %s tickers from Polygon (exchange=%s)...", tier, exchange)
-            tickers = await self._polygon.get_tickers(
+            tickers = await self._router.route(
+                "universe_builder.get_tickers",
+                self._polygon.get_tickers,
+                self._fmp_get_tickers if self._fmp else None,
                 market="stocks",
                 exchange=exchange,
                 type="CS",          # Common Stock only

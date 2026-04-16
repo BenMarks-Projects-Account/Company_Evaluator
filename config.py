@@ -1,5 +1,6 @@
 """Application configuration — loads from environment variables."""
 
+import json
 import os
 import sys
 from pydantic import model_validator
@@ -69,6 +70,12 @@ class Settings(BaseSettings):
     fmp_rate_limit_per_min: int = 300 # Paid tier: 300 req/min
     fmp_base_url: str = "https://financialmodelingprep.com/stable"
 
+    # Data source routing — per-call-site overrides for Polygon→FMP migration.
+    # JSON string mapping call-site keys to "polygon", "fmp", or "shadow".
+    # Unspecified call sites fall back to "default" key, then to "polygon".
+    # Example: '{"default":"polygon","entry_point.get_snapshot":"fmp"}'
+    data_source_overrides: str = "{}"
+
     # Pipeline
     universe: str = "sp500_top100"
     crawler_enabled: bool = False
@@ -93,6 +100,23 @@ class Settings(BaseSettings):
     @property
     def database_path(self) -> str:
         return sqlite_url_to_path(self.database_url)
+
+    def get_data_source(self, call_site_key: str) -> str:
+        """Return "polygon", "fmp", or "shadow" for a given call site.
+
+        Resolution order:
+          1. Exact match in data_source_overrides
+          2. "default" key in data_source_overrides
+          3. "polygon" (hardcoded ultimate fallback)
+        """
+        try:
+            overrides = json.loads(self.data_source_overrides)
+        except (json.JSONDecodeError, TypeError):
+            overrides = {}
+        value = overrides.get(call_site_key, overrides.get("default", "polygon"))
+        if value not in ("polygon", "fmp", "shadow"):
+            return "polygon"
+        return value
     
     class Config:
         env_file = ".env"
@@ -100,3 +124,22 @@ class Settings(BaseSettings):
 
 def get_settings() -> Settings:
     return Settings()
+
+
+# ── Known call-site keys (documentation / iteration) ──────────
+DATA_SOURCE_CALL_SITES = [
+    "company_data_service.get_financials",
+    "company_data_service.get_company_details",
+    "company_data_service.get_price_history",
+    "entry_point.get_raw_bars",
+    "entry_point.get_rsi",
+    "entry_point.get_sma",
+    "entry_point.get_macd",
+    "entry_point.get_snapshot",
+    "chart_service.get_raw_bars",
+    "routes_quote.get_snapshot",
+    "routes_admin.get_company_details",
+    "on_demand.get_company_details",
+    "on_demand.get_snapshot",
+    "universe_builder.get_tickers",
+]

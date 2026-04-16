@@ -1,12 +1,61 @@
-"""FMP (Financial Modeling Prep) client — cross-validation + Polygon fallback."""
+"""FMP (Financial Modeling Prep) client — primary data source for Company Evaluator.
 
+Covers financial statements, company profiles, price history, real-time quotes,
+technical indicators, insider trading, and more.
+"""
+
+import asyncio
 import logging
 import time
-from datetime import date
+from datetime import date, timedelta
 
 import httpx
+import numpy as np
 
 _log = logging.getLogger(__name__)
+
+
+# ── Token-bucket rate limiter ────────────────────────────────────────────
+
+class _TokenBucketRateLimiter:
+    """Async token-bucket rate limiter for FMP's 300 req/min limit.
+
+    Parameters
+    ----------
+    max_per_min : int
+        Hard ceiling from the API provider (default 300).
+    safety_pct : float
+        Fraction of *max_per_min* to actually use (default 0.80 → 240 effective).
+    """
+
+    def __init__(self, max_per_min: int = 300, safety_pct: float = 0.80):
+        self._capacity = max(1, int(max_per_min * safety_pct))
+        self._tokens = float(self._capacity)
+        self._refill_rate = self._capacity / 60.0  # tokens per second
+        self._last_refill = time.monotonic()
+        self._lock = asyncio.Lock()
+
+    @property
+    def effective_rpm(self) -> int:
+        return self._capacity
+
+    async def acquire(self):
+        """Wait until a token is available, then consume one."""
+        while True:
+            async with self._lock:
+                self._refill()
+                if self._tokens >= 1.0:
+                    self._tokens -= 1.0
+                    return
+                # How long until 1 token is available?
+                wait = (1.0 - self._tokens) / self._refill_rate
+            await asyncio.sleep(wait)
+
+    def _refill(self):
+        now = time.monotonic()
+        elapsed = now - self._last_refill
+        self._tokens = min(self._capacity, self._tokens + elapsed * self._refill_rate)
+        self._last_refill = now
 
 
 class FMPClient:
@@ -16,16 +65,17 @@ class FMPClient:
       1. Cross-validation of Finnhub ratio metrics (Tier 2)
       2. Financial statement fallback when Polygon returns empty (Tier 3)
       3. Insider trading + institutional ownership data (Tier 4)
+      4. Price history, real-time quotes, and technical indicators (primary)
 
     Paid tier: 300 requests/min.
+    All methods share a single token-bucket rate limiter (default 80 % safety → 240 req/min).
     """
 
     def __init__(self, api_key: str, base_url: str = "https://financialmodelingprep.com/api/v3",
-                 rate_limit_per_min: int = 300):
+                 rate_limit_per_min: int = 300, rate_limit_safety_pct: float = 0.80):
         self._api_key = api_key
         self._base_url = base_url
-        self._min_interval = 60.0 / rate_limit_per_min  # seconds between requests
-        self._last_request = 0.0
+        self._rate_limiter = _TokenBucketRateLimiter(rate_limit_per_min, rate_limit_safety_pct)
         self._calls_today = 0
         self._calls_reset_date = date.today()
         self._disabled_paths: set[str] = set()  # paths that returned 402 (plan limit)
@@ -310,23 +360,258 @@ class FMPClient:
             return result
         return None
 
+    # ── Price / quote / technical indicator endpoints ────────
+
+    async def get_historical_price_eod(
+        self,
+        symbol: str,
+        from_date: str | None = None,
+        to_date: str | None = None,
+    ) -> list[dict] | None:
+        """Fetch daily OHLCV bars from FMP's historical-price-eod/full endpoint.
+
+        Returns a list of dicts in the same shape that Polygon callers expect::
+
+            [{date, open, high, low, close, volume}, ...]  (oldest-first)
+
+        Field-name translations from FMP → Polygon caller shape:
+          - FMP "date" → kept as "date"
+          - FMP "open"/"high"/"low"/"close"/"volume" → kept as-is
+          - FMP returns newest-first; we reverse to oldest-first to match
+            Polygon's ``get_raw_bars()`` contract.
+        """
+        params: dict = {"symbol": symbol}
+        if from_date:
+            params["from"] = from_date
+        if to_date:
+            params["to"] = to_date
+
+        data = await self._request("/stable/historical-price-eod/full", params=params)
+
+        if not data or not isinstance(data, list):
+            return None
+
+        bars = []
+        for item in data:
+            if "close" not in item or "date" not in item:
+                continue
+            bars.append({
+                "date": item["date"],
+                "open": item.get("open"),
+                "high": item.get("high"),
+                "low": item.get("low"),
+                "close": item["close"],
+                "volume": item.get("volume", 0),
+            })
+
+        # FMP returns newest-first; Polygon callers expect oldest-first
+        bars.reverse()
+        return bars if bars else None
+
+    async def get_quote(self, symbol: str) -> dict | None:
+        """Fetch real-time quote from FMP's /stable/quote endpoint.
+
+        Returns a dict in the same shape that Polygon ``get_snapshot()`` callers
+        expect::
+
+            {symbol, last_price, day_open, day_high, day_low, day_close,
+             day_volume, day_vwap, prev_close, change, change_pct, ...}
+
+        Field-name translations from FMP → Polygon snapshot shape:
+          - FMP "price"        → "last_price"
+          - FMP "open"         → "day_open"
+          - FMP "dayHigh"      → "day_high"
+          - FMP "dayLow"       → "day_low"
+          - FMP "price"        → "day_close"  (FMP has no separate intraday close)
+          - FMP "volume"       → "day_volume"
+          - FMP "avgVolume"    → "avg_volume"  (bonus; not in Polygon shape)
+          - FMP "previousClose"→ "prev_close"
+          - FMP "change"       → "change"
+          - FMP "changesPercentage" → "change_pct" (converted to fraction)
+          - FMP has no bid/ask/vwap — those fields are set to None.
+        """
+        data = await self._request("/stable/quote", params={"symbol": symbol})
+
+        if not data or not isinstance(data, list) or len(data) == 0:
+            return None
+
+        q = data[0]
+        change_pct_raw = q.get("changesPercentage")
+        change_pct = change_pct_raw / 100.0 if change_pct_raw is not None else None
+
+        # Derive change_pct from change / previousClose if not provided
+        if change_pct is None:
+            change = q.get("change")
+            prev_close = q.get("previousClose")
+            if change is not None and prev_close and prev_close != 0:
+                change_pct = change / prev_close
+
+        return {
+            "symbol": q.get("symbol"),
+            "last_price": q.get("price"),
+            "last_size": None,           # FMP doesn't provide
+            "bid": None,                 # FMP quote doesn't include bid/ask
+            "ask": None,
+            "bid_size": None,
+            "ask_size": None,
+            "day_open": q.get("open"),
+            "day_high": q.get("dayHigh"),
+            "day_low": q.get("dayLow"),
+            "day_close": q.get("price"),  # FMP uses "price" as current/close
+            "day_volume": q.get("volume"),
+            "day_vwap": None,            # FMP quote doesn't include VWAP
+            "prev_close": q.get("previousClose"),
+            "prev_volume": None,         # FMP quote doesn't include prev volume
+            "change": q.get("change"),
+            "change_pct": change_pct,
+            "avg_volume": q.get("avgVolume"),
+            "market_cap": q.get("marketCap"),
+        }
+
+    async def get_technical_indicator(
+        self,
+        symbol: str,
+        indicator: str,
+        period_length: int,
+        timeframe: str = "1day",
+    ) -> float | None:
+        """Fetch a single technical indicator value from FMP.
+
+        Generic wrapper around ``/stable/technical-indicators/{indicator}``.
+
+        Parameters
+        ----------
+        symbol : str
+            Ticker symbol (e.g. "AAPL").
+        indicator : str
+            One of "rsi", "sma", "ema", "wma", "dema", "tema",
+            "williams", "adx", "standarddeviation".
+        period_length : int
+            Look-back window (e.g. 14 for RSI, 50 for SMA-50).
+        timeframe : str
+            Bar interval: "1min", "5min", "15min", "30min",
+            "1hour", "4hour", "1day" (default).
+
+        Returns
+        -------
+        float | None
+            The most recent indicator value, or None on failure.
+            Matches the return type of Polygon's ``get_rsi()`` and ``get_sma()``.
+        """
+        data = await self._request(
+            f"/stable/technical-indicators/{indicator}",
+            params={
+                "symbol": symbol,
+                "periodLength": period_length,
+                "timeframe": timeframe,
+            },
+        )
+
+        if not data or not isinstance(data, list) or len(data) == 0:
+            return None
+
+        # FMP returns newest-first; grab the first entry's indicator value
+        entry = data[0]
+        return entry.get(indicator)
+
+    async def get_macd(
+        self,
+        symbol: str,
+        timeframe: str = "1day",
+        fast: int = 12,
+        slow: int = 26,
+        signal: int = 9,
+    ) -> dict | None:
+        """Compute MACD locally from FMP EMA data.
+
+        MACD is not a native FMP endpoint, so we compute it from two EMA calls:
+
+            MACD line = EMA(fast) − EMA(slow)      (default: EMA-12 − EMA-26)
+            Signal line = EMA(signal) of the MACD line  (default: 9-period EMA)
+            Histogram = MACD line − Signal line
+
+        We seed the EMA with an SMA of the first *signal* MACD values
+        (oldest in the window), then apply the standard EMA formula
+        forward to produce the most-recent signal value.
+
+        Returns
+        -------
+        dict | None
+            ``{"value": float, "signal": float, "histogram": float}``
+            matching Polygon's ``get_macd()`` return shape, or None on failure.
+        """
+        # We need signal + signal points for EMA warm-up (SMA seed + forward pass)
+        lookback = signal * 2 + 5  # generous buffer
+
+        fast_data = await self._request(
+            f"/stable/technical-indicators/ema",
+            params={
+                "symbol": symbol,
+                "periodLength": fast,
+                "timeframe": timeframe,
+            },
+        )
+        slow_data = await self._request(
+            f"/stable/technical-indicators/ema",
+            params={
+                "symbol": symbol,
+                "periodLength": slow,
+                "timeframe": timeframe,
+            },
+        )
+
+        if not fast_data or not slow_data:
+            return None
+        if not isinstance(fast_data, list) or not isinstance(slow_data, list):
+            return None
+
+        # Build date-aligned MACD series (both come newest-first from FMP)
+        fast_map = {e["date"]: e.get("ema") for e in fast_data if "date" in e and e.get("ema") is not None}
+        slow_map = {e["date"]: e.get("ema") for e in slow_data if "date" in e and e.get("ema") is not None}
+
+        common_dates = sorted(set(fast_map) & set(slow_map), reverse=True)
+        if len(common_dates) < signal:
+            # Not enough data to compute signal line
+            if common_dates:
+                macd_val = fast_map[common_dates[0]] - slow_map[common_dates[0]]
+                return {"value": macd_val, "signal": None, "histogram": None}
+            return None
+
+        # Build MACD series oldest-first for EMA computation
+        macd_series = [fast_map[d] - slow_map[d] for d in reversed(common_dates)]
+
+        # Compute EMA of MACD series with period = signal
+        # Seed: SMA of first `signal` values
+        k = 2.0 / (signal + 1)
+        ema = float(np.mean(macd_series[:signal]))
+        for val in macd_series[signal:]:
+            ema = val * k + ema * (1 - k)
+
+        macd_value = macd_series[-1]  # most recent
+        signal_value = ema
+        histogram = macd_value - signal_value
+
+        return {
+            "value": macd_value,
+            "signal": signal_value,
+            "histogram": histogram,
+        }
+
     # ── HTTP layer ───────────────────────────────────────────
 
     async def _request(self, path: str, params: dict | None = None):
-        """Make a rate-limited request to FMP API."""
-        import asyncio
+        """Make a rate-limited request to FMP API.
+
+        Uses a token-bucket limiter shared across all FMP methods.
+        """
         self._maybe_reset_counter()
 
         # Skip paths that previously returned 402 (plan not included)
         if path in self._disabled_paths:
             return None
 
-        # Per-minute rate limiting
-        now = time.monotonic()
-        elapsed = now - self._last_request
-        if elapsed < self._min_interval:
-            await asyncio.sleep(self._min_interval - elapsed)
-        self._last_request = time.monotonic()
+        # Wait for a token from the bucket (replaces old per-request sleep)
+        await self._rate_limiter.acquire()
 
         # Route stable endpoints to the stable base URL, v3 endpoints to the configured base
         if path.startswith("/stable/"):
@@ -345,6 +630,7 @@ class FMPClient:
                 if resp.status_code == 429:
                     _log.warning("[FMP] 429 rate-limited on %s — backing off 2s", path)
                     await asyncio.sleep(2)
+                    await self._rate_limiter.acquire()
                     resp = await client.get(url, params=req_params)
                     self._calls_today += 1
                     if resp.status_code != 200:

@@ -553,11 +553,29 @@ async def _fetch_profile(symbol: str) -> dict | None:
     settings = get_settings()
     profile: dict = {"symbol": symbol}
 
-    # Polygon details
+    # Polygon details (routed)
     if settings.polygon_api_key:
         try:
+            from data.data_source_router import get_router
             poly = PolygonClient(settings.polygon_api_key, settings.polygon_rate_limit)
-            details = await poly.get_company_details(symbol)
+
+            fmp_profile_fn = None
+            if settings.fmp_api_key:
+                from data.fmp_client import FMPClient as _FMPClient
+                _fmp_r = _FMPClient(
+                    api_key=settings.fmp_api_key,
+                    base_url=settings.fmp_base_url,
+                    rate_limit_per_min=settings.fmp_rate_limit_per_min,
+                )
+                fmp_profile_fn = _fmp_r.get_company_profile
+
+            router = get_router()
+            details = await router.route(
+                "on_demand.get_company_details",
+                poly.get_company_details,
+                fmp_profile_fn,
+                symbol,
+            )
             if details and not details.get("error"):
                 profile.update({
                     "name": details.get("company_name"),
@@ -616,11 +634,29 @@ async def _fetch_profile(symbol: str) -> dict | None:
     profile["sector"] = fmp_sector or fh_sector or pg_sic or None
     profile["industry"] = fmp_industry or fh_sector or pg_sic or None
 
-    # Current price from Polygon snapshot
+    # Current price from Polygon snapshot (routed)
     if settings.polygon_api_key:
         try:
+            from data.data_source_router import get_router as _get_router
             poly = PolygonClient(settings.polygon_api_key, settings.polygon_rate_limit)
-            snap = await poly.get_snapshot(symbol)
+
+            fmp_quote_fn = None
+            if settings.fmp_api_key:
+                from data.fmp_client import FMPClient as _FMPClient2
+                _fmp_q = _FMPClient2(
+                    api_key=settings.fmp_api_key,
+                    base_url=settings.fmp_base_url,
+                    rate_limit_per_min=settings.fmp_rate_limit_per_min,
+                )
+                fmp_quote_fn = _fmp_q.get_quote
+
+            rtr = _get_router()
+            snap = await rtr.route(
+                "on_demand.get_snapshot",
+                poly.get_snapshot,
+                fmp_quote_fn,
+                symbol,
+            )
             if snap:
                 profile["price"] = snap.get("last_price")
                 profile["shares_outstanding"] = None  # not in snapshot

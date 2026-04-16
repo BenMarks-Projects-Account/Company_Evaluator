@@ -12,6 +12,7 @@ from datetime import datetime, timedelta
 
 from config import get_settings
 from data.polygon_client import PolygonClient
+from data.data_source_router import get_router
 
 _log = logging.getLogger(__name__)
 
@@ -67,7 +68,29 @@ async def get_chart_data(symbol: str, timeframe: str = "1Y") -> dict:
         rate_limit=settings.polygon_rate_limit,
     )
 
-    bars = await polygon.get_raw_bars(symbol, days=fetch_days)
+    # FMP adapter for routed calls
+    fmp_bars_fn = None
+    if settings.fmp_enabled and settings.fmp_api_key:
+        from datetime import date as _date, timedelta as _td
+        from data.fmp_client import FMPClient
+        _fmp = FMPClient(
+            api_key=settings.fmp_api_key,
+            base_url=settings.fmp_base_url,
+            rate_limit_per_min=settings.fmp_rate_limit_per_min,
+        )
+        async def _fmp_bars(symbol_arg, days=365):
+            from_date = (_date.today() - _td(days=days)).isoformat()
+            return await _fmp.get_historical_price_eod(symbol_arg, from_date=from_date)
+        fmp_bars_fn = _fmp_bars
+
+    router = get_router()
+
+    bars = await router.route(
+        "chart_service.get_raw_bars",
+        polygon.get_raw_bars,
+        fmp_bars_fn,
+        symbol, days=fetch_days,
+    )
     if not bars:
         raise RuntimeError(f"No price data available for {symbol}")
 

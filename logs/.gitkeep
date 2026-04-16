@@ -1,0 +1,2 @@
+# Logs are now written to %LOCALAPPDATA%\CompanyEvaluator\logs
+# This directory is kept for backward compatibility only.
