@@ -1,0 +1,44 @@
+{
+  "achieved": {
+    "healthcare_selected": 0,
+    "healthcare_shortfall": 400,
+    "tech_selected": 0,
+    "tech_shortfall": 600,
+    "total_selected": 0
+  },
+  "bucket_stats": {
+    "healthcare_candidates": 0,
+    "healthcare_target": 400,
+    "tech_candidates": 0,
+    "tech_target": 600
+  },
+  "filter_funnel": {
+    "filter_1_already_in_universe": 687,
+    "filter_1_country": 0,
+    "filter_1_exchange": 0,
+    "filter_1_symbol_shape": 0,
+    "filter_2_sector": 0,
+    "filter_3_market_cap": 0,
+    "filter_4_revenue": 0,
+    "filter_5_gross_margin": 0,
+    "filter_6_sustainability": 0,
+    "filter_7_history": 0,
+    "missing_data_balance_sheet": 0,
+    "missing_data_cash_flow": 0,
+    "missing_data_income_statement": 0,
+    "missing_data_profile": 0,
+    "not_in_bulk_cache": 5
+  },
+  "inserted_rows": 0,
+  "mode": "dry_run",
+  "notable_near_misses": [],
+  "screener_waiver": {
+    "existing_universe_rows": 2994,
+    "screener_comms_returned": 80,
+    "screener_healthcare_returned": 332,
+    "screener_tech_returned": 280,
+    "total_new_vs_existing_universe": 5,
+    "total_screener_rows": 692
+  },
+  "selected_symbols": []
+}
