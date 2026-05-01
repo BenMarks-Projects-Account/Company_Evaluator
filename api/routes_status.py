@@ -1,5 +1,6 @@
 """Status dashboard API — aggregated system info for the launcher."""
 
+import asyncio
 import os
 import time
 import logging
@@ -16,10 +17,47 @@ _log = logging.getLogger(__name__)
 
 _start_time = time.time()
 
+# ── Dashboard payload cache ─────────────────────────────────
+# The launcher polls /api/status/dashboard every 5s. Under crawler
+# load this endpoint can stall past the launcher's 3s timeout while
+# its SQLAlchemy queries queue behind crawler queries on the same pool.
+# A short TTL cache returns the fully-formed payload from memory so
+# polls stay responsive regardless of DB contention.
+DASHBOARD_TTL_SECONDS = 3.0
+_dashboard_cache: dict = {"payload": None, "expires_at": 0.0}
+_dashboard_cache_lock = asyncio.Lock()
+
+
+async def _get_dashboard_payload():
+    """Return the dashboard payload, refreshing from DB at most once per TTL."""
+    now = time.monotonic()
+    if _dashboard_cache["payload"] is not None and now < _dashboard_cache["expires_at"]:
+        return _dashboard_cache["payload"]
+    async with _dashboard_cache_lock:
+        # Double-check after acquiring lock — another coroutine may have refreshed.
+        now = time.monotonic()
+        if _dashboard_cache["payload"] is not None and now < _dashboard_cache["expires_at"]:
+            return _dashboard_cache["payload"]
+        t0 = time.monotonic()
+        payload = await _build_dashboard_payload()
+        query_ms = round((time.monotonic() - t0) * 1000, 1)
+        _dashboard_cache["payload"] = payload
+        _dashboard_cache["expires_at"] = time.monotonic() + DASHBOARD_TTL_SECONDS
+        _log.info(
+            "event=dashboard_cache_refresh ttl=%.1f query_ms=%s",
+            DASHBOARD_TTL_SECONDS, query_ms,
+        )
+        return payload
+
 
 @router.get("/status/dashboard")
 async def dashboard():
-    """Aggregated status for the launcher dashboard."""
+    """Aggregated status for the launcher dashboard (cached, TTL=3s)."""
+    return await _get_dashboard_payload()
+
+
+async def _build_dashboard_payload():
+    """Build the dashboard payload from live sources. Called at most once per TTL."""
 
     # ── Backend info ─────────────────────────────────────────
     pid = os.getpid()
