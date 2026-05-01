@@ -23,7 +23,7 @@ _start_time = time.time()
 # its SQLAlchemy queries queue behind crawler queries on the same pool.
 # A short TTL cache returns the fully-formed payload from memory so
 # polls stay responsive regardless of DB contention.
-DASHBOARD_TTL_SECONDS = 3.0
+DASHBOARD_TTL_SECONDS = 6.0
 _dashboard_cache: dict = {"payload": None, "expires_at": 0.0}
 _dashboard_cache_lock = asyncio.Lock()
 
