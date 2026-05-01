@@ -128,9 +128,10 @@ async def evaluate_company(symbol: str, force: bool = False, skip_rankings: bool
             fmp_data = await fmp_client.get_all_cross_validation_data(symbol)
             bf = company_data.get("basic_financials")
             if bf and isinstance(bf, dict) and "metrics" in bf:
-                _, cross_validation_flags = cross_validate_finnhub_metrics(
-                    bf["metrics"], fmp_data
-                )
+                # Disabled post-remove-shadow-mode: Polygon retired, single-source cross-validation is meaningless.
+                # _, cross_validation_flags = cross_validate_finnhub_metrics(
+                #     bf["metrics"], fmp_data
+                # )
                 if cross_validation_flags:
                     _log.info("[%s] Step 1b: %d metric(s) adjusted by FMP cross-validation",
                               symbol, len(cross_validation_flags))
