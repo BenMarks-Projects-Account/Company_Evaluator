@@ -169,4 +169,13 @@ def _annual_cagr(annual: list[dict], field: str, years: int) -> float | None:
 
 
 def _r(v, decimals=4):
-    return round(v, decimals) if v is not None else None
+    if v is None:
+        return None
+    try:
+        return round(float(v), decimals)
+    except (TypeError, ValueError):
+        # Defensive: catches complex numbers, strings, and other unexpected
+        # types so a single upstream bug can't null out the whole pillar.
+        # Log loudly so a regression of this shape doesn't go unnoticed.
+        _log.warning("_r received unexpected type %s: %r", type(v).__name__, v)
+        return None

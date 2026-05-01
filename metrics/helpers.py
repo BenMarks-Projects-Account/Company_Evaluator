@@ -103,8 +103,19 @@ def latest(statements: list[dict], field: str) -> float | None:
 
 
 def cagr(old_val, new_val, years: int) -> float | None:
-    """Compound annual growth rate.  Returns as a ratio (0.10 = 10 %)."""
-    if old_val is None or new_val is None or old_val <= 0 or years <= 0:
+    """Compound annual growth rate.  Returns as a ratio (0.10 = 10 %).
+
+    Returns None when CAGR is mathematically undefined:
+      * old_val or new_val missing
+      * old_val <= 0 (cannot express compound rate from a zero or negative base)
+      * new_val <= 0 (raising a negative ratio to a fractional power yields a
+        complex number in Python; also, a sign flip cannot be expressed as a
+        real compound rate)
+      * years <= 0
+    """
+    if old_val is None or new_val is None or years <= 0:
+        return None
+    if old_val <= 0 or new_val <= 0:
         return None
     return (new_val / old_val) ** (1 / years) - 1
 
