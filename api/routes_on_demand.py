@@ -116,7 +116,14 @@ async def get_research_prompt(symbol: str):
     try:
         prompt_text = build_research_prompt(result)
     except Exception as e:
-        _log.exception("Failed to build research prompt for %s", symbol)
+        company_shape = (
+            {k: type(v).__name__ for k, v in company.items()}
+            if isinstance(company, dict) else type(company).__name__
+        )
+        _log.exception(
+            "Failed to build research prompt for %s | company field types: %s",
+            symbol, company_shape,
+        )
         return {
             "ok": False,
             "symbol": symbol,

@@ -108,7 +108,14 @@ async def generate_business_profile(
     try:
         prompt = _build_user_prompt(symbol, profile, evaluation, comps)
     except Exception as e:
-        _log.warning("[business_profile] prompt build failed for %s: %s", symbol, e)
+        profile_shape = (
+            {k: type(v).__name__ for k, v in profile.items()}
+            if isinstance(profile, dict) else type(profile).__name__
+        )
+        _log.warning(
+            "[business_profile] prompt build failed for %s: %s | profile field types: %s",
+            symbol, e, profile_shape,
+        )
         return {
             "ok": False,
             "llm_available": False,
@@ -227,13 +234,19 @@ def _build_user_prompt(symbol: str, profile: dict, evaluation: dict | None, comp
             peers = pg.get("symbols", [])[:8]
     peers_str = ", ".join(str(p) for p in peers) if peers else "unknown"
 
+    emp_raw = profile.get("employees")
+    try:
+        employees_str = f"{int(float(emp_raw)):,}" if emp_raw not in (None, "") else "unknown"
+    except (TypeError, ValueError):
+        employees_str = str(emp_raw) if emp_raw else "unknown"
+
     return USER_PROMPT_TEMPLATE.format(
         symbol=symbol,
         name=profile.get("name") or profile.get("company_name") or symbol,
         sector=profile.get("sector") or "unknown",
         industry=profile.get("industry") or "unknown",
         market_cap=fmt_money(profile.get("market_cap")),
-        employees=f"{profile.get('employees'):,}" if profile.get("employees") else "unknown",
+        employees=employees_str,
         description=profile.get("description") or "No description available",
         revenue_ttm=fmt_money(metrics.get("revenue")),
         gross_margin=fmt_pct(metrics.get("gross_margin")),

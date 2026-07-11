@@ -15,6 +15,32 @@ import numpy as np
 _log = logging.getLogger(__name__)
 
 
+def _coerce_number(value):
+    """Coerce value to int/float when possible; return None for empty/unparseable.
+
+    FMP occasionally returns numeric fields as strings (e.g. fullTimeEmployees="164000")
+    and downstream formatters like ``f"{x:,}"`` fail on string input with
+    ``ValueError: Cannot specify ',' with 's'.``  Apply at the ingestion boundary.
+    """
+    if value is None or value == "":
+        return None
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return value
+    if isinstance(value, str):
+        v = value.replace(",", "").replace("$", "").strip()
+        if not v:
+            return None
+        try:
+            if "." in v or "e" in v.lower():
+                return float(v)
+            return int(v)
+        except ValueError:
+            return None
+    return None
+
+
 # ── Token-bucket rate limiter ────────────────────────────────────────────
 
 class _TokenBucketRateLimiter:
@@ -94,18 +120,29 @@ class FMPClient:
     # ── Cross-validation endpoints (Tier 2) ──────────────────
 
     async def get_company_profile(self, symbol: str) -> dict | None:
-        """Fetch company profile with clean sector/industry labels."""
+        """Fetch company profile with clean sector/industry labels.
+
+        Numeric fields (market_cap, employees) are coerced to numbers because
+        the FMP /stable/profile endpoint returns some of them as strings
+        (e.g. fullTimeEmployees="164000") and the field name for market cap
+        was renamed from "mktCap" to "marketCap" — both shapes are accepted
+        for forward/backward compatibility.
+        """
         data = await self._request(f"/stable/profile", params={"symbol": symbol})
         if data and isinstance(data, list) and len(data) > 0:
             item = data[0]
+            # FMP renamed mktCap → marketCap; accept either for safety.
+            mc_raw = item.get("marketCap")
+            if mc_raw is None:
+                mc_raw = item.get("mktCap")
             return {
                 "symbol": item.get("symbol"),
                 "company_name": item.get("companyName"),
                 "sector": item.get("sector"),
                 "industry": item.get("industry"),
-                "market_cap": item.get("mktCap"),
+                "market_cap": _coerce_number(mc_raw),
                 "description": item.get("description"),
-                "employees": item.get("fullTimeEmployees"),
+                "employees": _coerce_number(item.get("fullTimeEmployees")),
                 "website": item.get("website"),
                 "country": item.get("country"),
                 "exchange": item.get("exchangeShortName"),

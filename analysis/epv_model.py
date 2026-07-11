@@ -75,6 +75,12 @@ def compute_epv(
     if not annual or len(annual) < MIN_REQUIRED_YEARS:
         return _error(f"Insufficient annual history — need {MIN_REQUIRED_YEARS}+ years", now)
 
+    # Coerce in case upstream passed a numeric string (FMP shape change defense).
+    if isinstance(market_cap, str):
+        try:
+            market_cap = float(market_cap.replace(",", "").replace("$", "").strip())
+        except ValueError:
+            market_cap = None
     if not market_cap or market_cap <= 0:
         return _error("Market cap not available", now)
 

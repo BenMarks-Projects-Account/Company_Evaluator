@@ -97,9 +97,15 @@ def _company_snapshot_section(symbol, name, sector, industry, market_cap, price,
     if market_cap:
         parts.append(f"- **Market Cap**: ${_fmt_money(market_cap)}")
     if price:
-        parts.append(f"- **Current Price** (when evaluated): ${price:.2f}")
+        try:
+            parts.append(f"- **Current Price** (when evaluated): ${float(price):.2f}")
+        except (TypeError, ValueError):
+            parts.append(f"- **Current Price** (when evaluated): {price}")
     if employees:
-        parts.append(f"- **Employees**: {employees:,}")
+        try:
+            parts.append(f"- **Employees**: {int(float(employees)):,}")
+        except (TypeError, ValueError):
+            parts.append(f"- **Employees**: {employees}")
     return "\n".join(parts)
 
 
