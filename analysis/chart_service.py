@@ -102,6 +102,11 @@ async def get_chart_data(symbol: str, timeframe: str = "1Y") -> dict:
     sma_50_full = _compute_sma(bars, period=50)
     sma_200_full = _compute_sma(bars, period=200)
 
+    # Bollinger Bands: 20-period SMA of close ± 2 * population std (ddof=0)
+    boll_mid_full, boll_up_full, boll_lo_full = _compute_bollinger(
+        bars, period=20, num_std=2.0
+    )
+
     # Find the visible window start date
     today = datetime.utcnow().date()
     visible_start = (today - timedelta(days=visible_days)).isoformat()
@@ -116,6 +121,10 @@ async def get_chart_data(symbol: str, timeframe: str = "1Y") -> dict:
     prices_visible = []
     sma_50_visible = []
     sma_200_visible = []
+    bollinger_middle_visible = []
+    bollinger_upper_visible = []
+    bollinger_lower_visible = []
+    volume_visible = []
     for i in range(visible_start_idx, len(bars)):
         prices_visible.append({
             "date": bars[i]["date"],
@@ -128,6 +137,22 @@ async def get_chart_data(symbol: str, timeframe: str = "1Y") -> dict:
         sma_200_visible.append({
             "date": bars[i]["date"],
             "value": round(sma_200_full[i], 4) if sma_200_full[i] is not None else None,
+        })
+        bollinger_middle_visible.append({
+            "date": bars[i]["date"],
+            "value": round(boll_mid_full[i], 4) if boll_mid_full[i] is not None else None,
+        })
+        bollinger_upper_visible.append({
+            "date": bars[i]["date"],
+            "value": round(boll_up_full[i], 4) if boll_up_full[i] is not None else None,
+        })
+        bollinger_lower_visible.append({
+            "date": bars[i]["date"],
+            "value": round(boll_lo_full[i], 4) if boll_lo_full[i] is not None else None,
+        })
+        volume_visible.append({
+            "date": bars[i]["date"],
+            "value": bars[i].get("volume"),
         })
 
     # 52-week high/low from the last 252 bars of the FULL series
@@ -165,6 +190,10 @@ async def get_chart_data(symbol: str, timeframe: str = "1Y") -> dict:
         "prices": prices_visible,
         "sma_50": sma_50_visible,
         "sma_200": sma_200_visible,
+        "bollinger_middle": bollinger_middle_visible,
+        "bollinger_upper": bollinger_upper_visible,
+        "bollinger_lower": bollinger_lower_visible,
+        "volume": volume_visible,
         "levels": {
             "support": round(support, 2) if support else None,
             "resistance": round(resistance, 2) if resistance else None,
@@ -210,6 +239,42 @@ def _compute_sma(series: list[dict], period: int) -> list[float | None]:
             result.append(None)
 
     return result
+
+
+def _compute_bollinger(
+    series: list[dict],
+    period: int = 20,
+    num_std: float = 2.0,
+) -> tuple[list[float | None], list[float | None], list[float | None]]:
+    """
+    Bollinger Bands over close prices.
+
+    Returns three lists (middle, upper, lower) aligned to ``series`` where
+    the first (period-1) entries are None (warmup). ``middle`` is the
+    simple moving average of the last ``period`` closes; ``upper`` and
+    ``lower`` are middle ± ``num_std`` * population std (ddof=0) computed
+    over the same trailing window.
+    """
+    closes = [bar["close"] for bar in series]
+    n = len(closes)
+    middle: list[float | None] = [None] * n
+    upper: list[float | None] = [None] * n
+    lower: list[float | None] = [None] * n
+
+    if period <= 0 or n < period:
+        return middle, upper, lower
+
+    for i in range(period - 1, n):
+        window = closes[i - period + 1 : i + 1]
+        mean = sum(window) / period
+        # population variance (ddof=0)
+        variance = sum((x - mean) ** 2 for x in window) / period
+        std = variance ** 0.5
+        middle[i] = mean
+        upper[i] = mean + num_std * std
+        lower[i] = mean - num_std * std
+
+    return middle, upper, lower
 
 
 def _compute_support_resistance(
